@@ -44,10 +44,11 @@ export function addRoute(
 
 export function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": Buffer.byteLength(payload).toString(),
-  });
+  // setHeader (not writeHead's header object) so CORS headers set earlier
+  // in the request lifecycle aren't clobbered.
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Content-Length", Buffer.byteLength(payload).toString());
+  res.writeHead(status);
   res.end(payload);
 }
 
@@ -63,6 +64,19 @@ async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
 
 export function createServer(): http.Server {
   return http.createServer(async (req, res) => {
+    // CORS headers on every response. The daemon is localhost-only (binds
+    // 127.0.0.1), so * is acceptable — the network is the only attacker
+    // surface and we exclude that by binding loopback.
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Max-Age", "86400");
+    if ((req.method ?? "").toUpperCase() === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     try {
       const url = new URL(req.url ?? "/", "http://localhost");
       const pathOnly = url.pathname;

@@ -43,6 +43,13 @@ const blockDebouncers = new WeakMap<Element, ReturnType<typeof setTimeout>>();
 // on tab reload, which is the intended behavior.
 const dispatchedContent = new Set<string>();
 
+// Single-flight gate. With body-level MO + claude.ai's heavy streaming
+// re-renders, dozens of tryDispatch promises can stack up — even with
+// content dedupe, slight text variations across renders sneak past it.
+// This gate ensures at most one dispatch is being processed at a time;
+// late arrivals reschedule and re-evaluate after the current one finishes.
+let dispatchInFlight = false;
+
 // Monotonic counter for assigning ordinals to assistant messages we observe.
 // Pre-existing messages get sequential ordinals during init; new messages get
 // the next one when first encountered.
@@ -135,11 +142,15 @@ function handleMutations(mutations: MutationRecord[]): void {
         : findBuggerBlocksIn(el);
       for (const b of newBlocks) blocksToCheck.add(b);
     }
-    // CharacterData / subtree changes: re-check blocks within the changed area.
+    // CharacterData / subtree changes: re-check the containing bugger
+    // wrapper, IF this mutation is inside one. Earlier this used
+    // closest("pre") which matched any of the 300+ code blocks on the
+    // page — every keystroke churn re-fired the dispatch path on
+    // unrelated pres.
     if (mut.target.nodeType === Node.ELEMENT_NODE) {
       const target = mut.target as Element;
-      const containingBlock = target.closest("pre");
-      if (containingBlock) blocksToCheck.add(containingBlock);
+      const buggerWrapper = target.closest('[aria-label="bugger code"]');
+      if (buggerWrapper) blocksToCheck.add(buggerWrapper);
     }
   }
 
@@ -237,51 +248,62 @@ async function tryDispatch(block: Element): Promise<void> {
     block.setAttribute("data-bugger-handled", "duplicate-content");
     return;
   }
+
+  // Single-flight gate. If something is already being dispatched,
+  // reschedule this block and let the in-flight one finish first.
+  if (dispatchInFlight) {
+    scheduleBlockCheck(block);
+    return;
+  }
+  dispatchInFlight = true;
   dispatchedContent.add(content);
 
-  const ordinal = getOrAssignMessageOrdinal(message);
-  const blockIndex = indexOfBlockInMessage(block, message);
-  const blockId = await computeBlockId(content, blockIndex, ordinal);
+  try {
+    const ordinal = getOrAssignMessageOrdinal(message);
+    const blockIndex = indexOfBlockInMessage(block, message);
+    const blockId = await computeBlockId(content, blockIndex, ordinal);
 
-  if (dispatchedBlocks.has(blockId)) {
-    block.setAttribute("data-bugger-handled", "duplicate");
-    return;
-  }
+    if (dispatchedBlocks.has(blockId)) {
+      block.setAttribute("data-bugger-handled", "duplicate");
+      return;
+    }
 
-  // Mark BEFORE the network call so a re-fire during dispatch can't double-send.
-  block.setAttribute("data-bugger-handled", "dispatching");
-  dispatchedBlocks.set(blockId, "pending");
+    block.setAttribute("data-bugger-handled", "dispatching");
+    dispatchedBlocks.set(blockId, "pending");
 
-  await chrome.runtime.sendMessage({ type: "dispatchStart" }).catch(() => {});
+    await chrome.runtime.sendMessage({ type: "dispatchStart" }).catch(() => {});
 
-  const dispatchResult = await daemon.dispatch(myTabBinding, content);
-  if (daemon.isDaemonError(dispatchResult)) {
+    const dispatchResult = await daemon.dispatch(myTabBinding, content);
+    if (daemon.isDaemonError(dispatchResult)) {
+      await chrome.runtime.sendMessage({ type: "dispatchEnd" }).catch(() => {});
+      await injectErrorMessage(dispatchResult.error, dispatchResult.status);
+      block.setAttribute("data-bugger-handled", "dispatch-failed");
+      return;
+    }
+
+    const jobId = dispatchResult.jobId;
+    dispatchedBlocks.set(blockId, jobId);
+
+    const job = await pollJob(jobId);
     await chrome.runtime.sendMessage({ type: "dispatchEnd" }).catch(() => {});
-    await injectErrorMessage(dispatchResult.error, dispatchResult.status);
-    block.setAttribute("data-bugger-handled", "dispatch-failed");
-    return;
+
+    if (!job) {
+      await injectErrorMessage("daemon unreachable while polling job", 0);
+      block.setAttribute("data-bugger-handled", "poll-failed");
+      return;
+    }
+
+    if (daemon.isDaemonError(job)) {
+      await injectErrorMessage(job.error, job.status);
+      block.setAttribute("data-bugger-handled", "poll-error");
+      return;
+    }
+
+    await injectResult(job);
+    block.setAttribute("data-bugger-handled", "completed");
+  } finally {
+    dispatchInFlight = false;
   }
-
-  const jobId = dispatchResult.jobId;
-  dispatchedBlocks.set(blockId, jobId);
-
-  const job = await pollJob(jobId);
-  await chrome.runtime.sendMessage({ type: "dispatchEnd" }).catch(() => {});
-
-  if (!job) {
-    await injectErrorMessage("daemon unreachable while polling job", 0);
-    block.setAttribute("data-bugger-handled", "poll-failed");
-    return;
-  }
-
-  if (daemon.isDaemonError(job)) {
-    await injectErrorMessage(job.error, job.status);
-    block.setAttribute("data-bugger-handled", "poll-error");
-    return;
-  }
-
-  await injectResult(job);
-  block.setAttribute("data-bugger-handled", "completed");
 }
 
 function getOrAssignMessageOrdinal(messageNode: Element): number {
