@@ -354,17 +354,35 @@ function formatErrorInjection(message: string, status: number): string {
 // --- injection --------------------------------------------------------------
 
 async function injectResult(job: Job): Promise<void> {
-  await injectText(formatResult(job));
+  // Successful worker results may auto-submit (if the user has the toggle on).
+  await injectText(formatResult(job), { allowAutoSubmit: true });
 }
 
 async function injectErrorMessage(message: string, status: number): Promise<void> {
-  await injectText(formatErrorInjection(message, status));
+  // Errors NEVER auto-submit. The user should see and acknowledge a
+  // dispatch failure before it goes back to the manager — otherwise
+  // transient failures (daemon restart, network blip) flood the chat
+  // with noise the manager has to talk past.
+  await injectText(formatErrorInjection(message, status), { allowAutoSubmit: false });
 }
 
-async function injectText(text: string): Promise<void> {
+async function injectText(text: string, opts: { allowAutoSubmit: boolean }): Promise<void> {
   const input = findInputTextarea();
   if (!input) {
     console.warn("[bugger] cannot inject result — input textarea not found");
+    return;
+  }
+
+  // Safety: don't stomp the user's draft text. If the input has any
+  // non-whitespace content (a worker result already sitting there, or
+  // typing in progress), abort. The user clears the input on their own
+  // terms and can ask the manager to re-dispatch if needed.
+  const existing = readEditorContent(input).trim();
+  if (existing.length > 0) {
+    console.warn(
+      `[bugger] inject aborted — input has existing text (${existing.length} chars); ` +
+        `clear the input manually before the next dispatch`,
+    );
     return;
   }
 
@@ -382,7 +400,7 @@ async function injectText(text: string): Promise<void> {
     await sleep(INJECT_CHECK_MS);
   }
 
-  if (autoSubmit) {
+  if (autoSubmit && opts.allowAutoSubmit) {
     await sleep(100); // let React reconcile state
     const send = findSendButton();
     if (!send) {
