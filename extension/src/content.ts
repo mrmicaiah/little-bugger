@@ -23,7 +23,6 @@ import type { Job } from "./lib/daemonClient.js";
 // --- module-level state -----------------------------------------------------
 
 const DEBOUNCE_MS = 500;
-const INJECT_CHECK_MS = 75;
 const STREAM_WAIT_MAX_MS = 30_000;
 
 // Dispatched block ids → in-flight job ids. Prevents re-dispatching the same
@@ -408,18 +407,8 @@ async function injectText(text: string, opts: { allowAutoSubmit: boolean }): Pro
     return;
   }
 
-  const ok = await tryInjectModernPath(input, text);
-  if (!ok) {
-    // Refinement B fallback: execCommand. Deprecated but the most reliable
-    // way to type into a ProseMirror contenteditable today.
-    try {
-      input.focus();
-      document.execCommand("insertText", false, text);
-    } catch (err) {
-      console.warn(`[bugger] execCommand fallback also failed: ${(err as Error).message}`);
-      return;
-    }
-    await sleep(INJECT_CHECK_MS);
+  if (!performInject(input, text)) {
+    return; // performInject already logged the failure
   }
 
   if (autoSubmit && opts.allowAutoSubmit) {
@@ -433,16 +422,16 @@ async function injectText(text: string, opts: { allowAutoSubmit: boolean }): Pro
   }
 }
 
-async function tryInjectModernPath(input: HTMLElement, text: string): Promise<boolean> {
-  // Refinement B: modern path is the leader. Position cursor at end, insert
-  // a text node via Range, dispatch beforeinput + input events with the
-  // insertText inputType so React/ProseMirror controllers update their state.
+function performInject(input: HTMLElement, text: string): boolean {
+  // Single-path injection. We used to also run an execCommand fallback when
+  // a 75ms verification check decided the InputEvent path "didn't take" —
+  // but that check produced false negatives, the fallback fired anyway, and
+  // ProseMirror absorbed BOTH insertions (the modern one as inline-collapsed
+  // text + the execCommand one as a real multi-line code block), submitting
+  // the worker result doubled in a single message. The modern path is
+  // verified to work end-to-end on production claude.ai; if it ever stops
+  // working, add a real retry — don't pre-emptively double-inject.
   input.focus();
-
-  // Read snapshot before for the "did it take?" check.
-  const probe = text.slice(0, Math.min(40, text.length));
-  const beforeRead = readEditorContent(input);
-
   try {
     const isTextarea = input.tagName === "TEXTAREA" || input.tagName === "INPUT";
     if (isTextarea) {
@@ -458,7 +447,9 @@ async function tryInjectModernPath(input: HTMLElement, text: string): Promise<bo
       }
       ta.dispatchEvent(new Event("input", { bubbles: true }));
     } else {
-      // Contenteditable: insert at end via Range API.
+      // Contenteditable (ProseMirror): insert at end via Range API and
+      // dispatch beforeinput + input events so the editor's state controller
+      // sees the change.
       const selection = window.getSelection();
       if (selection) {
         selection.removeAllRanges();
@@ -471,7 +462,6 @@ async function tryInjectModernPath(input: HTMLElement, text: string): Promise<bo
         selection.removeAllRanges();
         selection.addRange(range);
       }
-      // Notify the editor.
       input.dispatchEvent(
         new InputEvent("beforeinput", {
           bubbles: true,
@@ -489,17 +479,11 @@ async function tryInjectModernPath(input: HTMLElement, text: string): Promise<bo
         }),
       );
     }
+    return true;
   } catch (err) {
-    console.warn(`[bugger] modern injection path threw: ${(err as Error).message}`);
+    console.warn(`[bugger] injection failed: ${(err as Error).message}`);
     return false;
   }
-
-  await sleep(INJECT_CHECK_MS);
-  const afterRead = readEditorContent(input);
-  if (afterRead.length > beforeRead.length && afterRead.includes(probe)) {
-    return true;
-  }
-  return false;
 }
 
 function readEditorContent(input: HTMLElement): string {
