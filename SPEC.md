@@ -8,9 +8,9 @@ Two pieces: a local daemon and a Chrome extension. Together they're "Little Bugg
 
 ## What it solves
 
-You manage 3-4 projects at once. Each project has a manager (a claude.ai conversation in its own browser tab) and a worker (Claude Code running locally in that project's repo). Today you are the message bus: you copy prompts from manager to terminal, copy results back to manager, do that across four pairs. It works but it's exhausting and the terminals are ugly.
+You manage multiple projects, often several at once. Each project has a manager (a claude.ai conversation in its own browser tab) and a worker (Claude Code running locally in that project's repo). Today you are the message bus: you copy prompts from manager to terminal, copy results back to manager, do that across every pair you've got going. It works but it's exhausting and the terminals are ugly.
 
-Little Bugger removes the message bus. Manager emits a dispatch block; the extension routes it to the daemon; the daemon runs Claude Code in the right repo; the result auto-appears in the manager's chat as a follow-up user message. Terminals stay minimized. You manage four managers from your browser.
+Little Bugger removes the message bus. Manager emits a dispatch block; the extension routes it to the daemon; the daemon runs Claude Code in the right repo; the result auto-appears in the manager's chat as a follow-up user message. Terminals stay minimized. You manage your projects from your browser.
 
 ---
 
@@ -75,15 +75,26 @@ When a dispatch arrives:
 
 ### Config
 
-`~/.bugger/config.json` (or `%APPDATA%\bugger\config.json` on Windows):
+`~/.bugger/config.json` (or `%APPDATA%\bugger\config.json` on Windows).
+
+The config ships **empty by default** — no projects preloaded. The user adds projects to it as they want to use them with Little Bugger. Projects come and go; the user works on many, and only the ones currently active need a binding.
+
+Shape:
+
+```json
+{
+  "projects": {},
+  "anthropic_api_key": "sk-ant-...",
+  "port": 8765
+}
+```
+
+Adding a project is one entry, name and absolute path:
 
 ```json
 {
   "projects": {
-    "the-big-brain": "C:\\Users\\mrmic\\Projects\\the-big-brain",
-    "medi-vault": "C:\\Users\\mrmic\\Projects\\medi-vault",
-    "softball-project": "C:\\Users\\mrmic\\Projects\\softball-project",
-    "white-shovel-software": "C:\\Users\\mrmic\\Projects\\white-shovel-software"
+    "my-project": "/Users/mrmic/Projects/my-project"
   },
   "anthropic_api_key": "sk-ant-...",
   "port": 8765
@@ -92,7 +103,9 @@ When a dispatch arrives:
 
 `anthropic_api_key` is here so Claude Code inherits it via the daemon's spawned environment. The daemon never sends this anywhere over the network — Claude Code is the only consumer.
 
-Per-machine. The laptop's config has its Windows paths; the Mac's has its `/Users/mrmic/...` paths. Same project names, different paths. Same skill works on both because the manager doesn't know or care about paths — it just dispatches by project name (which the extension bound the tab to).
+Per-machine. The laptop's config has its Windows paths; the Mac's has its `/Users/mrmic/...` paths. Same project names can refer to different paths on each machine. The same skill works on both because the manager doesn't know or care about paths — it just dispatches by the project name the extension bound the tab to.
+
+**Adding a project mid-day:** edit `config.json`, save. The daemon either auto-reloads on file change (preferred) or you `bugger reload` from a terminal. The extension's project dropdown picks up the new project on next popup open. No daemon restart needed.
 
 ### Discipline boundaries
 
@@ -110,8 +123,8 @@ Per-machine. The laptop's config has its Windows paths; the Mac's has its `/User
 ┌─────────────────────────────────────────────────────────┐
 │  Chrome / claude.ai tab                                  │
 │  ┌──────────────────────────────────────────────────┐   │
-│  │  Manager conversation (this tab bound to:        │   │
-│  │  medi-vault)                                      │   │
+│  │  Manager conversation (this tab bound to a       │   │
+│  │  project)                                          │   │
 │  │                                                    │   │
 │  │  Manager: "I'll run the test suite."             │   │
 │  │  ```bugger                                        │   │
@@ -123,7 +136,7 @@ Per-machine. The laptop's config has its Windows paths; the Mac's has its `/User
 │         ▼                                                │
 │  ┌──────────────────────────────────────────────────┐   │
 │  │  Little Bugger Extension                          │   │
-│  │  - Reads tab binding: medi-vault                 │   │
+│  │  - Reads tab binding                              │   │
 │  │  - POST localhost:8765/dispatch                  │   │
 │  │  - Polls /jobs/:id                                │   │
 │  │  - Injects result back as user message            │   │
@@ -134,9 +147,9 @@ Per-machine. The laptop's config has its Windows paths; the Mac's has its `/User
               ▼
 ┌─────────────────────────────────────────────────────────┐
 │  Bugger Daemon (Node, runs in background)                │
-│  - Receives /dispatch { project: medi-vault, prompt }   │
+│  - Receives /dispatch { project, prompt }                │
 │  - Looks up project path in config                       │
-│  - spawn claude code in C:\...\medi-vault               │
+│  - Spawns claude code in the project's repo              │
 │  - Captures stdout + git diff                            │
 │  - Holds result in memory until extension polls          │
 └─────────────────────────────────────────────────────────┘
@@ -145,7 +158,7 @@ Per-machine. The laptop's config has its Windows paths; the Mac's has its `/User
               ▼
 ┌─────────────────────────────────────────────────────────┐
 │  Claude Code (Anthropic CLI)                             │
-│  cwd: C:\Users\mrmic\Projects\medi-vault                │
+│  cwd: <project's repo path>                              │
 │  Reads CLAUDE.md, does the work, exits                   │
 │  Working tree left modified, unstaged                    │
 └─────────────────────────────────────────────────────────┘
@@ -156,7 +169,7 @@ Per-machine. The laptop's config has its Windows paths; the Mac's has its `/User
 ## Cross-platform packaging
 
 **The daemon ships as:**
-- Windows: `.msi` installer (created with `electron-builder` or `pkg` + WiX). Installs to `%LOCALAPPDATA%\Bugger\`. Registers a startup task so the daemon auto-starts on login. Adds `bugger` to PATH for `bugger ping` etc.
+- Windows: `.msi` installer (created with `electron-builder` or `pkg` + WiX). Installs to `%LOCALAPPDATA%\Bugger\`. Registers a startup task so the daemon auto-starts on login. Adds `bugger` to PATH for `bugger ping`, `bugger reload`, etc.
 - macOS: `.pkg` installer. Installs to `/usr/local/bin/bugger-daemon`. Registers a `LaunchAgent` plist so it auto-starts on login.
 - Both: same daemon Node executable, packaged for each platform via `pkg` or `nexe`.
 
@@ -168,10 +181,12 @@ Per-machine. The laptop's config has its Windows paths; the Mac's has its `/User
 **Setup ritual on a new machine:**
 1. Run installer (one-click)
 2. Install extension (one-click)
-3. Edit `~/.bugger/config.json` to set project paths and paste your `ANTHROPIC_API_KEY`
+3. Edit `~/.bugger/config.json` to paste your `ANTHROPIC_API_KEY` and add any projects you want to work on first
 4. Restart daemon (or just reboot)
 5. In Chrome, click the 🐛 icon, bind your first tab to a project
 6. Done
+
+You can add more projects to the config any time without reinstalling anything.
 
 ---
 
@@ -195,9 +210,10 @@ Same plan-review-build discipline as The Big Brain. Each phase ships a working s
 **Phase 1: Daemon foundation**
 - Node project, TypeScript
 - `/health`, `/config`, `/dispatch`, `/jobs/:id`, `/ping` endpoints
-- Reads `~/.bugger/config.json`
+- Reads `~/.bugger/config.json` (empty `projects` is valid — daemon starts fine with zero projects configured)
 - Spawns Claude Code, captures output + diff
 - Per-project serialization queue
+- Hot-reloads config on file change (watcher on the config file)
 - Manual testing via curl
 
 **Phase 2: Chrome extension**
@@ -217,7 +233,7 @@ Same plan-review-build discipline as The Big Brain. Each phase ships a working s
 **Phase 4: Manager skill + onboarding**
 - Polish the skill document
 - Write a setup guide for the user (`docs/getting-started.md`) with screenshots
-- "First five minutes" walkthrough: install → configure → bind first tab → run first dispatch
+- "First five minutes" walkthrough: install → configure → add first project → bind first tab → run first dispatch
 
 **Phase 5: Polish and ship**
 - Extension to Chrome Web Store
@@ -234,6 +250,7 @@ Same plan-review-build discipline as The Big Brain. Each phase ships a working s
 - **Persistent job history.** Jobs live in daemon memory, lost on restart. The chat itself is the record of what was dispatched and what came back.
 - **Auto-reconnect on disconnect.** If the daemon dies mid-dispatch, the extension shows an error and the user retries. Daemon restart is rare enough that recovery automation is overkill.
 - **Multi-tab to one project.** Each tab binds to one project. Two tabs on the same project = two managers fighting over one worker (per-project serialization queues them, but the UX is weird). Don't do it.
+- **Project discovery / auto-detection.** The user configures projects explicitly. No "scan ~/Projects for git repos" — too many false positives, too magic. Manual entry is honest about what's claimed for Little Bugger.
 
 ---
 
@@ -248,6 +265,8 @@ Same plan-review-build discipline as The Big Brain. Each phase ships a working s
 **Local, fast, no cloud.** Everything happens on your machine. No deploys, no secrets in a Cloudflare worker, no auth tokens to rotate. The only thing the daemon needs is your Anthropic API key for Claude Code to use.
 
 **Be honest about what it is.** Little Bugger is a courier. It carries messages between the manager (where you think) and the worker (where work happens). It is not a manager. It is not a brain. It is the pipe.
+
+**Projects are user-owned, not preloaded.** The user has many repos and uses different ones at different times. Little Bugger has no opinion about which exist; the user adds them to config as they want to use them. Config edits are live without daemon restart.
 
 ---
 
@@ -264,7 +283,7 @@ little-bugger/
 │   ├── tsconfig.json
 │   └── src/
 │       ├── index.ts              — entry, HTTP server
-│       ├── config.ts             — load + validate ~/.bugger/config.json
+│       ├── config.ts             — load + validate + watch ~/.bugger/config.json
 │       ├── jobs.ts               — in-memory job queue + execution
 │       ├── claudeCode.ts         — spawn + capture
 │       └── routes/
