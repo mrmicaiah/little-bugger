@@ -5,6 +5,16 @@ import { getConfig, getProjectPath } from "./config.js";
 
 export type JobStatus = "queued" | "running" | "succeeded" | "failed";
 
+// Worker-activity phases derived from Claude Code's stream-json output.
+// Updated live during job execution so the extension can show a status pill.
+export type JobPhase =
+  | "started"
+  | "reading"
+  | "editing"
+  | "running_command"
+  | "thinking"
+  | "done";
+
 export type Job = {
   id: string;
   project: string;
@@ -17,6 +27,8 @@ export type Job = {
   diffSummary?: string;
   error?: string;
   exitCode?: number;
+  phase?: JobPhase;
+  phaseDetail?: string;
 };
 
 // NO PERSISTENCE — by design. All state below is in-memory and fresh on every
@@ -68,9 +80,18 @@ async function runNext(project: string): Promise<void> {
   }
 
   const apiKey = getConfig().anthropic_api_key;
+  job.phase = "started";
 
   try {
-    const result = await runClaudeCode({ cwd, prompt: job.prompt, apiKey });
+    const result = await runClaudeCode({
+      cwd,
+      prompt: job.prompt,
+      apiKey,
+      onPhase: (phase, detail) => {
+        job.phase = phase;
+        job.phaseDetail = detail;
+      },
+    });
     if (result.isError) {
       finishJob(job, {
         status: "failed",
@@ -100,6 +121,8 @@ function finishJob(
 ): void {
   Object.assign(job, fields);
   job.endedAt = Date.now();
+  job.phase = "done";
+  job.phaseDetail = undefined;
   const duration = job.endedAt - (job.startedAt ?? job.createdAt);
   const exit = job.exitCode !== undefined ? ` exit=${job.exitCode}` : "";
   console.log(`[job] ${job.status} id=${job.id} project=${job.project} duration_ms=${duration}${exit}`);

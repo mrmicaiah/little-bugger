@@ -24,5 +24,7 @@ export const jobHandler: Handler = ({ res, params }) => {
   if (job.diffSummary !== undefined && job.diffSummary !== "") out["diffSummary"] = job.diffSummary;
   if (job.error !== undefined) out["error"] = job.error;
   if (job.exitCode !== undefined) out["exitCode"] = job.exitCode;
+  if (job.phase !== undefined) out["phase"] = job.phase;
+  if (job.phaseDetail !== undefined) out["phaseDetail"] = job.phaseDetail;
   sendJson(res, 200, out);
 };

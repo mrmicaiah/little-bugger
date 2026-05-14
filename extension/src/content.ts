@@ -18,7 +18,8 @@ import {
   findSendButton,
 } from "./lib/selectors.js";
 import * as daemon from "./lib/daemonClient.js";
-import type { Job } from "./lib/daemonClient.js";
+import type { Job, JobPhase } from "./lib/daemonClient.js";
+import * as statusPill from "./lib/statusPill.js";
 
 // --- module-level state -----------------------------------------------------
 
@@ -256,6 +257,7 @@ async function tryDispatch(block: Element): Promise<void> {
   }
   dispatchInFlight = true;
   dispatchedContent.add(content);
+  statusPill.show("Worker dispatched");
 
   try {
     const ordinal = getOrAssignMessageOrdinal(message);
@@ -283,7 +285,15 @@ async function tryDispatch(block: Element): Promise<void> {
     const jobId = dispatchResult.jobId;
     dispatchedBlocks.set(blockId, jobId);
 
-    const job = await pollJob(jobId);
+    // Live status updates: re-render the pill whenever the daemon's reported
+    // phase changes. Same text → no DOM update; the show() helper skips it.
+    let lastPhaseKey: string | undefined;
+    const job = await pollJob(jobId, (snapshot) => {
+      const phaseKey = `${snapshot.phase ?? ""}|${snapshot.phaseDetail ?? ""}`;
+      if (phaseKey === lastPhaseKey) return;
+      lastPhaseKey = phaseKey;
+      statusPill.show(formatPhase(snapshot.phase, snapshot.phaseDetail));
+    });
     await chrome.runtime.sendMessage({ type: "dispatchEnd" }).catch(() => {});
 
     if (!job) {
@@ -302,6 +312,21 @@ async function tryDispatch(block: Element): Promise<void> {
     block.setAttribute("data-bugger-handled", "completed");
   } finally {
     dispatchInFlight = false;
+    // Pill stays visible briefly after the result lands, then fades.
+    // Guaranteed to fire even on early-return or thrown paths.
+    statusPill.hideAfter(2000);
+  }
+}
+
+function formatPhase(phase: JobPhase | undefined, detail: string | undefined): string {
+  switch (phase) {
+    case "started":         return "Worker dispatched";
+    case "reading":         return detail ? `Worker reading ${detail}...` : "Worker reading files...";
+    case "editing":         return detail ? `Worker editing ${detail}...` : "Worker editing files...";
+    case "running_command": return detail ? `Worker running ${detail}...` : "Worker running command...";
+    case "thinking":        return "Worker thinking...";
+    case "done":            return "Worker done";
+    default:                return "Worker working...";
   }
 }
 
@@ -336,7 +361,10 @@ async function computeBlockId(
 
 // --- polling ----------------------------------------------------------------
 
-async function pollJob(jobId: string): Promise<Job | daemon.DaemonError | null> {
+async function pollJob(
+  jobId: string,
+  onSnapshot?: (job: Job) => void,
+): Promise<Job | daemon.DaemonError | null> {
   const start = Date.now();
   while (true) {
     const elapsed = Date.now() - start;
@@ -345,6 +373,7 @@ async function pollJob(jobId: string): Promise<Job | daemon.DaemonError | null> 
     const result = await daemon.getJob(jobId);
     if (result === null) return null; // daemon unreachable
     if (daemon.isDaemonError(result)) return result;
+    if (onSnapshot) onSnapshot(result);
     if (result.status === "succeeded" || result.status === "failed") return result;
     // queued / running — keep polling
   }

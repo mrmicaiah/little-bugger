@@ -8,6 +8,14 @@ export type DaemonConfig = { projects: string[] };
 
 export type JobStatus = "queued" | "running" | "succeeded" | "failed";
 
+export type JobPhase =
+  | "started"
+  | "reading"
+  | "editing"
+  | "running_command"
+  | "thinking"
+  | "done";
+
 export type Job = {
   id: string;
   project: string;
@@ -19,6 +27,8 @@ export type Job = {
   diffSummary?: string;
   error?: string;
   exitCode?: number;
+  phase?: JobPhase;
+  phaseDetail?: string;
 };
 
 export type DispatchOk = { jobId: string };

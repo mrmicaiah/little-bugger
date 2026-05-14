@@ -1,5 +1,6 @@
 import crossSpawn from "cross-spawn";
 import type { ChildProcess } from "node:child_process";
+import type { JobPhase } from "./jobs.js";
 
 export type RunResult = {
   output: string;
@@ -7,6 +8,8 @@ export type RunResult = {
   isError: boolean;
   errorText?: string;
 };
+
+export type PhaseUpdate = (phase: JobPhase, detail?: string) => void;
 
 const active = new Set<ChildProcess>();
 
@@ -20,10 +23,73 @@ export function killAllActive(): void {
   }
 }
 
+// Map a Claude Code tool_use event into a job phase + a short human detail
+// (file basename, command preview, etc.). The phase strings match the JobPhase
+// enum; the extension formats them for user display.
+function derivePhaseFromTool(name: string, input: unknown): { phase: JobPhase; detail?: string } {
+  const lname = (name ?? "").toLowerCase();
+  const inputObj = (typeof input === "object" && input !== null ? input : {}) as Record<string, unknown>;
+
+  const pickString = (...keys: string[]): string | undefined => {
+    for (const k of keys) {
+      const v = inputObj[k];
+      if (typeof v === "string" && v.length > 0) return v;
+    }
+    return undefined;
+  };
+  const basename = (p: string): string => {
+    const parts = p.replace(/\\/g, "/").split("/");
+    return parts[parts.length - 1] || p;
+  };
+  const truncate = (s: string, n: number): string => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+
+  if (lname === "read") {
+    const p = pickString("file_path");
+    return { phase: "reading", detail: p ? basename(p) : undefined };
+  }
+  if (lname === "glob") {
+    return { phase: "reading", detail: truncate(pickString("pattern") ?? "files", 40) };
+  }
+  if (lname === "grep") {
+    return { phase: "reading", detail: truncate(pickString("pattern") ?? "files", 40) };
+  }
+  if (lname === "edit" || lname === "write" || lname === "multiedit") {
+    const p = pickString("file_path");
+    return { phase: "editing", detail: p ? basename(p) : undefined };
+  }
+  if (lname === "notebookedit") {
+    const p = pickString("notebook_path", "file_path");
+    return { phase: "editing", detail: p ? basename(p) : undefined };
+  }
+  if (lname === "bash") {
+    const cmd = pickString("command");
+    return { phase: "running_command", detail: cmd ? truncate(cmd, 40) : undefined };
+  }
+  // Unknown / agent / web tools all read as "thinking" — keeps the pill
+  // honest about not knowing what's happening rather than pretending.
+  return { phase: "thinking" };
+}
+
+function derivePhaseFromAssistant(msg: Record<string, unknown>): { phase: JobPhase; detail?: string } | null {
+  const message = msg["message"] as Record<string, unknown> | undefined;
+  const content = message?.["content"];
+  if (!Array.isArray(content)) return null;
+  for (const block of content) {
+    if (block && typeof block === "object" && (block as Record<string, unknown>)["type"] === "tool_use") {
+      const b = block as Record<string, unknown>;
+      const name = typeof b["name"] === "string" ? b["name"] : "";
+      return derivePhaseFromTool(name, b["input"]);
+    }
+  }
+  // No tool use this turn — pure reasoning/text.
+  return { phase: "thinking" };
+}
+
 export function runClaudeCode(opts: {
   cwd: string;
   prompt: string;
   apiKey: string;
+  onPhase?: PhaseUpdate;
 }): Promise<RunResult> {
   return new Promise((resolve) => {
     const args = [
@@ -70,7 +136,12 @@ export function runClaudeCode(opts: {
         if (!line) continue;
         try {
           const msg = JSON.parse(line) as Record<string, unknown>;
-          if (msg["type"] === "result") {
+          if (msg["type"] === "system" && msg["subtype"] === "init") {
+            opts.onPhase?.("started");
+          } else if (msg["type"] === "assistant") {
+            const update = derivePhaseFromAssistant(msg);
+            if (update) opts.onPhase?.(update.phase, update.detail);
+          } else if (msg["type"] === "result") {
             sawResult = true;
             const r = msg["result"];
             finalOutput = typeof r === "string" ? r : "";
