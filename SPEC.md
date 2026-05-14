@@ -56,7 +56,7 @@ A small Node program running on the user's machine. Listens on `localhost:8765`.
 - `GET /config` — returns the configured project names (no paths leaked) so the extension can populate the dropdown
 - `POST /dispatch` — body `{ project, prompt }` → creates a job, returns `{ jobId }`
 - `GET /jobs/:id` — returns current status: `queued | running | succeeded | failed` plus `output`, `diff_summary`, `error` as appropriate
-- `POST /ping` — body `{ project }` → dispatches a trivial "echo hello" to that project's worker and returns the round-trip time. For sanity-checking on each machine setup.
+- `POST /ping` — body `{ project }` → dispatches a trivial echo prompt to that project's worker and returns `{ jobId }` (same shape as `/dispatch`). The caller polls `/jobs/:id` and computes round-trip time from `endedAt − createdAt`. For sanity-checking on each machine setup.
 
 ### Job execution
 
