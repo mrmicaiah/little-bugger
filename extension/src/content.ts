@@ -33,6 +33,16 @@ const dispatchedBlocks = new Map<string, string>();
 // Debounce timers keyed by the block DOM node.
 const blockDebouncers = new WeakMap<Element, ReturnType<typeof setTimeout>>();
 
+// Content-level dedupe. claude.ai sometimes renders the same bugger block
+// as multiple DOM elements (edit history, regenerated responses,
+// virtualization clones). Each DOM copy is a distinct Element so the
+// per-block data-bugger-handled marker doesn't dedupe across them, and
+// the blockId-based dedupe varies because blockIndex/ordinal differ per
+// copy. Hashing the prompt content alone fixes both — same prompt in this
+// tab dispatches exactly once. Set is per-content-script (per-tab), reset
+// on tab reload, which is the intended behavior.
+const dispatchedContent = new Set<string>();
+
 // Monotonic counter for assigning ordinals to assistant messages we observe.
 // Pre-existing messages get sequential ordinals during init; new messages get
 // the next one when first encountered.
@@ -219,6 +229,15 @@ async function tryDispatch(block: Element): Promise<void> {
     block.setAttribute("data-bugger-handled", "unbound");
     return;
   }
+
+  // Content-level dedupe. Synchronous check+add: no await between them,
+  // so concurrent tryDispatches for DOM copies of the same prompt can't
+  // race past this guard. See comment on `dispatchedContent` above.
+  if (dispatchedContent.has(content)) {
+    block.setAttribute("data-bugger-handled", "duplicate-content");
+    return;
+  }
+  dispatchedContent.add(content);
 
   const ordinal = getOrAssignMessageOrdinal(message);
   const blockIndex = indexOfBlockInMessage(block, message);
