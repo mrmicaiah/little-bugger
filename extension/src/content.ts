@@ -1,0 +1,463 @@
+// Content script. Runs in every claude.ai tab. Owns:
+//   - block detection (MutationObserver + debounce + streaming-completion check)
+//   - dispatch to daemon
+//   - polling for results
+//   - injecting the worker result back into the chat input
+//
+// State lives in this script's globals — lost on tab refresh, which is the
+// intended behavior per SPEC §"What's out of scope for v0".
+
+import {
+  findMessageStream,
+  findAssistantMessages,
+  findBuggerBlocks,
+  extractBlockContent,
+  findContainingMessage,
+  isMessageStillStreaming,
+  findInputTextarea,
+  findSendButton,
+} from "./lib/selectors.js";
+import * as daemon from "./lib/daemonClient.js";
+import type { Job } from "./lib/daemonClient.js";
+
+// --- module-level state -----------------------------------------------------
+
+const DEBOUNCE_MS = 500;
+const INJECT_CHECK_MS = 75;
+const STREAM_WAIT_MAX_MS = 30_000;
+
+// Dispatched block ids → in-flight job ids. Prevents re-dispatching the same
+// block when MO fires multiple times for it.
+const dispatchedBlocks = new Map<string, string>();
+
+// Debounce timers keyed by the block DOM node.
+const blockDebouncers = new WeakMap<Element, ReturnType<typeof setTimeout>>();
+
+// Monotonic counter for assigning ordinals to assistant messages we observe.
+// Pre-existing messages get sequential ordinals during init; new messages get
+// the next one when first encountered.
+let messageOrdinalCounter = 0;
+
+let myTabBinding: string | null = null;
+let autoSubmit = true;
+
+// --- bootstrap --------------------------------------------------------------
+
+async function init(): Promise<void> {
+  // Get binding and settings from the service worker.
+  try {
+    const bindingResp = await chrome.runtime.sendMessage({ type: "getBindingForMe" });
+    myTabBinding = bindingResp?.project ?? null;
+  } catch {
+    myTabBinding = null;
+  }
+  try {
+    const settingsResp = await chrome.runtime.sendMessage({ type: "getSettings" });
+    autoSubmit = settingsResp?.autoSubmit ?? true;
+  } catch {
+    autoSubmit = true;
+  }
+
+  // Listen for binding / settings updates from the SW.
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg?.type === "bindingChanged") {
+      myTabBinding = msg.project ?? null;
+    } else if (msg?.type === "settingsChanged") {
+      autoSubmit = msg.autoSubmit ?? true;
+    }
+  });
+
+  // Wait for the message stream container to appear (claude.ai's SPA).
+  const stream = await waitForMessageStream();
+  if (!stream) {
+    console.warn("[bugger] message stream container not found after 30s; extension idle");
+    return;
+  }
+
+  // Initial scan: assign ordinals and mark all pre-existing bugger blocks as
+  // seen so we never re-dispatch historical content.
+  scanInitial();
+
+  // Attach the observer.
+  const observer = new MutationObserver(handleMutations);
+  observer.observe(stream, { childList: true, subtree: true, characterData: true });
+
+  console.log("[bugger] content script ready");
+}
+
+async function waitForMessageStream(): Promise<Element | null> {
+  const start = Date.now();
+  while (Date.now() - start < STREAM_WAIT_MAX_MS) {
+    const stream = findMessageStream();
+    if (stream) return stream;
+    await sleep(500);
+  }
+  return null;
+}
+
+function scanInitial(): void {
+  const messages = findAssistantMessages();
+  for (const msg of messages) {
+    getOrAssignMessageOrdinal(msg);
+    for (const block of findBuggerBlocks(msg)) {
+      // Mark as seen WITHOUT dispatching — these are history.
+      block.setAttribute("data-bugger-handled", "init-scan");
+    }
+  }
+}
+
+// --- mutation handling ------------------------------------------------------
+
+function handleMutations(mutations: MutationRecord[]): void {
+  const blocksToCheck = new Set<Element>();
+
+  for (const mut of mutations) {
+    // Added nodes: could be a new message OR new content within a message.
+    for (const node of mut.addedNodes) {
+      if (node.nodeType !== Node.ELEMENT_NODE) continue;
+      const el = node as Element;
+      // If a new assistant message appeared, assign its ordinal now.
+      const newMessages = isAssistantMessage(el) ? [el] : findAssistantMessages(el);
+      for (const m of newMessages) getOrAssignMessageOrdinal(m);
+      // Any new bugger blocks inside?
+      const newBlocks = isCodeBlock(el)
+        ? findBuggerBlocksMatchingNode(el)
+        : findBuggerBlocksIn(el);
+      for (const b of newBlocks) blocksToCheck.add(b);
+    }
+    // CharacterData / subtree changes: re-check blocks within the changed area.
+    if (mut.target.nodeType === Node.ELEMENT_NODE) {
+      const target = mut.target as Element;
+      const containingBlock = target.closest("pre");
+      if (containingBlock) blocksToCheck.add(containingBlock);
+    }
+  }
+
+  for (const block of blocksToCheck) {
+    scheduleBlockCheck(block);
+  }
+}
+
+function isAssistantMessage(el: Element): boolean {
+  // claude.ai marks each assistant turn with data-is-streaming (value
+  // "true" or "false"). selectors.ts uses the same anchor.
+  return el.matches?.("[data-is-streaming]") || false;
+}
+
+function isCodeBlock(el: Element): boolean {
+  return el.tagName === "PRE" || el.tagName === "CODE";
+}
+
+function findBuggerBlocksIn(root: Element): Element[] {
+  // root might be a message turn, a wrapper, anything — defer to selector lib.
+  const candidate = root.closest("[data-is-streaming]") ?? root;
+  return findBuggerBlocks(candidate);
+}
+
+function findBuggerBlocksMatchingNode(el: Element): Element[] {
+  // The added node IS a pre/code — check if it's a bugger block.
+  const message = findContainingMessage(el);
+  if (!message) return [];
+  const blocks = findBuggerBlocks(message);
+  return blocks.filter((b) => b === el || b.contains(el) || el.contains(b));
+}
+
+function scheduleBlockCheck(block: Element): void {
+  if (block.getAttribute("data-bugger-handled")) return; // already dispatched or seen
+
+  const existing = blockDebouncers.get(block);
+  if (existing) clearTimeout(existing);
+
+  // Speed-up: if the containing message is no longer streaming, we can
+  // dispatch sooner. Still wait one short tick to let DOM settle.
+  const message = findContainingMessage(block);
+  const fastPath = message && !isMessageStillStreaming(message);
+  const delay = fastPath ? 100 : DEBOUNCE_MS;
+
+  const timer = setTimeout(() => {
+    blockDebouncers.delete(block);
+    void tryDispatch(block);
+  }, delay);
+  blockDebouncers.set(block, timer);
+}
+
+// --- dispatch precondition + fire ------------------------------------------
+
+async function tryDispatch(block: Element): Promise<void> {
+  if (block.getAttribute("data-bugger-handled")) return;
+
+  const message = findContainingMessage(block);
+  if (!message) {
+    // Can't compute an id without a containing message; defer.
+    scheduleBlockCheck(block);
+    return;
+  }
+
+  // Refinement A precondition (1): block content must be non-empty and look
+  // like a closed code block. claude.ai strips the literal ``` fences during
+  // markdown rendering, so the structural signal is: the <pre> element exists
+  // with content, and the message turn either has more content AFTER the
+  // block OR has stopped streaming. The 500ms debounce (in scheduleBlockCheck)
+  // is the load-bearing piece — this content check is the cheap pre-filter.
+  const content = extractBlockContent(block).replace(/\s+$/, "");
+  if (!content) return;
+
+  // Refinement A precondition (2): if still streaming, re-arm and wait.
+  if (isMessageStillStreaming(message)) {
+    scheduleBlockCheck(block);
+    return;
+  }
+
+  // If the block is the LAST element in the message and streaming just
+  // stopped, we still want a brief settle window in case another mutation
+  // arrives. The fast-path delay above (100ms) provides this.
+
+  if (!myTabBinding) {
+    // Not bound — surface in console, don't auto-inject (could confuse user
+    // mid-conversation). Popup will surface this state.
+    console.warn("[bugger] block detected but tab not bound to any project; ignoring");
+    block.setAttribute("data-bugger-handled", "unbound");
+    return;
+  }
+
+  const ordinal = getOrAssignMessageOrdinal(message);
+  const blockIndex = indexOfBlockInMessage(block, message);
+  const blockId = await computeBlockId(content, blockIndex, ordinal);
+
+  if (dispatchedBlocks.has(blockId)) {
+    block.setAttribute("data-bugger-handled", "duplicate");
+    return;
+  }
+
+  // Mark BEFORE the network call so a re-fire during dispatch can't double-send.
+  block.setAttribute("data-bugger-handled", "dispatching");
+  dispatchedBlocks.set(blockId, "pending");
+
+  await chrome.runtime.sendMessage({ type: "dispatchStart" }).catch(() => {});
+
+  const dispatchResult = await daemon.dispatch(myTabBinding, content);
+  if (daemon.isDaemonError(dispatchResult)) {
+    await chrome.runtime.sendMessage({ type: "dispatchEnd" }).catch(() => {});
+    await injectErrorMessage(dispatchResult.error, dispatchResult.status);
+    block.setAttribute("data-bugger-handled", "dispatch-failed");
+    return;
+  }
+
+  const jobId = dispatchResult.jobId;
+  dispatchedBlocks.set(blockId, jobId);
+
+  const job = await pollJob(jobId);
+  await chrome.runtime.sendMessage({ type: "dispatchEnd" }).catch(() => {});
+
+  if (!job) {
+    await injectErrorMessage("daemon unreachable while polling job", 0);
+    block.setAttribute("data-bugger-handled", "poll-failed");
+    return;
+  }
+
+  if (daemon.isDaemonError(job)) {
+    await injectErrorMessage(job.error, job.status);
+    block.setAttribute("data-bugger-handled", "poll-error");
+    return;
+  }
+
+  await injectResult(job);
+  block.setAttribute("data-bugger-handled", "completed");
+}
+
+function getOrAssignMessageOrdinal(messageNode: Element): number {
+  const existing = messageNode.getAttribute("data-bugger-msg-ordinal");
+  if (existing !== null) {
+    const parsed = parseInt(existing, 10);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  const ordinal = messageOrdinalCounter++;
+  messageNode.setAttribute("data-bugger-msg-ordinal", String(ordinal));
+  return ordinal;
+}
+
+function indexOfBlockInMessage(block: Element, messageNode: Element): number {
+  const all = findBuggerBlocks(messageNode);
+  return all.indexOf(block);
+}
+
+async function computeBlockId(
+  content: string,
+  blockIndex: number,
+  messageOrdinal: number,
+): Promise<string> {
+  // Refinement C: sha1(content + indexOfBlockWithinMessage + sequentialMessageOrdinal).
+  const data = new TextEncoder().encode(`${content} ${blockIndex} ${messageOrdinal}`);
+  const buf = await crypto.subtle.digest("SHA-1", data);
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// --- polling ----------------------------------------------------------------
+
+async function pollJob(jobId: string): Promise<Job | daemon.DaemonError | null> {
+  const start = Date.now();
+  while (true) {
+    const elapsed = Date.now() - start;
+    const delay = elapsed < 10_000 ? 1000 : 3000;
+    await sleep(delay);
+    const result = await daemon.getJob(jobId);
+    if (result === null) return null; // daemon unreachable
+    if (daemon.isDaemonError(result)) return result;
+    if (result.status === "succeeded" || result.status === "failed") return result;
+    // queued / running — keep polling
+  }
+}
+
+// --- result formatting ------------------------------------------------------
+
+function formatResult(job: Job): string {
+  const parts: string[] = ["Worker result:", ""];
+  if (job.status === "failed") {
+    parts.push(`Status: FAILED (exit ${job.exitCode ?? "n/a"})`);
+    if (job.error) parts.push(`Error: ${job.error}`);
+    parts.push("");
+  }
+  if (job.output) parts.push(job.output);
+  if (job.diffSummary) {
+    parts.push("");
+    parts.push("Diff:");
+    parts.push(job.diffSummary);
+  }
+  return parts.join("\n");
+}
+
+function formatErrorInjection(message: string, status: number): string {
+  return `Worker dispatch failed: ${message}${status ? ` (HTTP ${status})` : ""}`;
+}
+
+// --- injection --------------------------------------------------------------
+
+async function injectResult(job: Job): Promise<void> {
+  await injectText(formatResult(job));
+}
+
+async function injectErrorMessage(message: string, status: number): Promise<void> {
+  await injectText(formatErrorInjection(message, status));
+}
+
+async function injectText(text: string): Promise<void> {
+  const input = findInputTextarea();
+  if (!input) {
+    console.warn("[bugger] cannot inject result — input textarea not found");
+    return;
+  }
+
+  const ok = await tryInjectModernPath(input, text);
+  if (!ok) {
+    // Refinement B fallback: execCommand. Deprecated but the most reliable
+    // way to type into a ProseMirror contenteditable today.
+    try {
+      input.focus();
+      document.execCommand("insertText", false, text);
+    } catch (err) {
+      console.warn(`[bugger] execCommand fallback also failed: ${(err as Error).message}`);
+      return;
+    }
+    await sleep(INJECT_CHECK_MS);
+  }
+
+  if (autoSubmit) {
+    await sleep(100); // let React reconcile state
+    const send = findSendButton();
+    if (!send) {
+      console.warn("[bugger] auto-submit on but send button not found; user will need to click Send");
+      return;
+    }
+    send.click();
+  }
+}
+
+async function tryInjectModernPath(input: HTMLElement, text: string): Promise<boolean> {
+  // Refinement B: modern path is the leader. Position cursor at end, insert
+  // a text node via Range, dispatch beforeinput + input events with the
+  // insertText inputType so React/ProseMirror controllers update their state.
+  input.focus();
+
+  // Read snapshot before for the "did it take?" check.
+  const probe = text.slice(0, Math.min(40, text.length));
+  const beforeRead = readEditorContent(input);
+
+  try {
+    const isTextarea = input.tagName === "TEXTAREA" || input.tagName === "INPUT";
+    if (isTextarea) {
+      // For native textareas, set value via the native setter (bypasses React
+      // value tracker) then fire input event.
+      const ta = input as HTMLTextAreaElement;
+      const proto = Object.getPrototypeOf(ta);
+      const nativeSetter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+      if (nativeSetter) {
+        nativeSetter.call(ta, (ta.value ?? "") + text);
+      } else {
+        ta.value = (ta.value ?? "") + text;
+      }
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+    } else {
+      // Contenteditable: insert at end via Range API.
+      const selection = window.getSelection();
+      if (selection) {
+        selection.removeAllRanges();
+        const range = document.createRange();
+        range.selectNodeContents(input);
+        range.collapse(false);
+        selection.addRange(range);
+        range.insertNode(document.createTextNode(text));
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      // Notify the editor.
+      input.dispatchEvent(
+        new InputEvent("beforeinput", {
+          bubbles: true,
+          cancelable: true,
+          data: text,
+          inputType: "insertText",
+        }),
+      );
+      input.dispatchEvent(
+        new InputEvent("input", {
+          bubbles: true,
+          cancelable: true,
+          data: text,
+          inputType: "insertText",
+        }),
+      );
+    }
+  } catch (err) {
+    console.warn(`[bugger] modern injection path threw: ${(err as Error).message}`);
+    return false;
+  }
+
+  await sleep(INJECT_CHECK_MS);
+  const afterRead = readEditorContent(input);
+  if (afterRead.length > beforeRead.length && afterRead.includes(probe)) {
+    return true;
+  }
+  return false;
+}
+
+function readEditorContent(input: HTMLElement): string {
+  if (input.tagName === "TEXTAREA" || input.tagName === "INPUT") {
+    return (input as HTMLTextAreaElement).value ?? "";
+  }
+  return input.innerText ?? input.textContent ?? "";
+}
+
+// --- utilities --------------------------------------------------------------
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// --- go ---------------------------------------------------------------------
+
+init().catch((err) => {
+  console.error(`[bugger] init failed: ${(err as Error).stack ?? (err as Error).message}`);
+});

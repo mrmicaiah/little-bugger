@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Little Bugger",
+  "version": "0.1.0",
+  "description": "Routes claude.ai manager dispatches to Claude Code on this machine.",
+  "permissions": ["activeTab", "storage"],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "http://localhost:8765/*"
+  ],
+  "background": {
+    "service_worker": "dist/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["dist/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Little Bugger",
+    "default_icon": {
+      "16": "icons/bug-gray-16.png",
+      "32": "icons/bug-gray-32.png",
+      "48": "icons/bug-gray-48.png",
+      "128": "icons/bug-gray-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/bug-gray-16.png",
+    "32": "icons/bug-gray-32.png",
+    "48": "icons/bug-gray-48.png",
+    "128": "icons/bug-gray-128.png"
+  }
+}

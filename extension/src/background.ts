@@ -1,0 +1,205 @@
+// Service worker. Kept deliberately small — MV3's SW sleeps after ~30s idle.
+// Responsibilities:
+//   - icon updates per tab (binding state × daemon reachability × dispatch state)
+//   - proxy daemon endpoints the popup needs (config, ping)
+//   - tab cleanup on close (storage hygiene)
+//   - light /health cache (10s TTL) to avoid hammering the daemon
+
+import * as daemon from "./lib/daemonClient.js";
+import {
+  getBinding,
+  setBinding,
+  clearBinding,
+  getSettings,
+  setSettings,
+  addDispatchingTab,
+  removeDispatchingTab,
+  getDispatchingTabs,
+  type Settings,
+} from "./lib/tabBinding.js";
+
+const HEALTH_CACHE_TTL = 10_000;
+let healthCache: { ok: boolean; timestamp: number } | null = null;
+
+async function isDaemonReachable(force = false): Promise<boolean> {
+  if (!force && healthCache && Date.now() - healthCache.timestamp < HEALTH_CACHE_TTL) {
+    return healthCache.ok;
+  }
+  const h = await daemon.health();
+  healthCache = { ok: h !== null, timestamp: Date.now() };
+  return healthCache.ok;
+}
+
+type IconState = "gray" | "green" | "orange";
+
+async function resolveIconState(tabId: number): Promise<IconState> {
+  const dispatching = await getDispatchingTabs();
+  if (dispatching.has(tabId)) return "orange";
+  const binding = await getBinding(tabId);
+  const reachable = await isDaemonReachable();
+  if (binding && reachable) return "green";
+  return "gray";
+}
+
+async function updateIcon(tabId: number): Promise<void> {
+  const state = await resolveIconState(tabId);
+  try {
+    await chrome.action.setIcon({
+      tabId,
+      path: {
+        16: `icons/bug-${state}-16.png`,
+        32: `icons/bug-${state}-32.png`,
+        48: `icons/bug-${state}-48.png`,
+        128: `icons/bug-${state}-128.png`,
+      },
+    });
+  } catch {
+    // Tab may have closed between the state lookup and the icon set; harmless.
+  }
+}
+
+async function updateAllVisibleIcons(): Promise<void> {
+  const tabs = await chrome.tabs.query({ url: "https://claude.ai/*" });
+  for (const tab of tabs) {
+    if (tab.id !== undefined) await updateIcon(tab.id);
+  }
+}
+
+// --- lifecycle hooks --------------------------------------------------------
+
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  void updateIcon(tabId);
+});
+
+chrome.tabs.onUpdated.addListener((tabId, _change, tab) => {
+  if (tab.url && tab.url.startsWith("https://claude.ai/")) {
+    void updateIcon(tabId);
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void clearBinding(tabId);
+  void removeDispatchingTab(tabId);
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  void updateAllVisibleIcons();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  // chrome.storage.session is cleared on browser restart; nothing to clean.
+  // Just refresh icons.
+  void updateAllVisibleIcons();
+});
+
+// --- message handling -------------------------------------------------------
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  void handleMessage(msg, sender)
+    .then((res) => sendResponse(res))
+    .catch((err) => {
+      console.error(`[bugger:sw] handler error: ${(err as Error).message}`);
+      sendResponse({ error: (err as Error).message });
+    });
+  return true; // async response
+});
+
+async function handleMessage(
+  msg: { type?: string } & Record<string, unknown>,
+  sender: chrome.runtime.MessageSender,
+): Promise<unknown> {
+  switch (msg?.type) {
+    case "getBindingForMe": {
+      const tabId = sender.tab?.id;
+      if (tabId === undefined) return { project: null };
+      return { project: await getBinding(tabId) };
+    }
+
+    case "getBinding": {
+      const tabId = typeof msg["tabId"] === "number" ? (msg["tabId"] as number) : sender.tab?.id;
+      if (tabId === undefined) return { project: null };
+      return { project: await getBinding(tabId) };
+    }
+
+    case "setBinding": {
+      const tabId = msg["tabId"] as number;
+      const project = msg["project"] as string;
+      if (typeof tabId !== "number" || typeof project !== "string") {
+        return { error: "tabId and project required" };
+      }
+      await setBinding(tabId, project);
+      await updateIcon(tabId);
+      // Notify the content script in that tab.
+      chrome.tabs.sendMessage(tabId, { type: "bindingChanged", project }).catch(() => {
+        // Content script may not be loaded yet — harmless.
+      });
+      return { ok: true };
+    }
+
+    case "getDaemonConfig": {
+      const config = await daemon.getConfig();
+      if (!config) {
+        healthCache = { ok: false, timestamp: Date.now() };
+        return { error: "daemon unreachable" };
+      }
+      healthCache = { ok: true, timestamp: Date.now() };
+      return config;
+    }
+
+    case "isDaemonReachable": {
+      const force = msg["force"] === true;
+      return { reachable: await isDaemonReachable(force) };
+    }
+
+    case "ping": {
+      const project = msg["project"] as string;
+      if (typeof project !== "string") return { error: "project required" };
+      return await daemon.ping(project);
+    }
+
+    case "getJob": {
+      const jobId = msg["jobId"] as string;
+      if (typeof jobId !== "string") return { error: "jobId required" };
+      return await daemon.getJob(jobId);
+    }
+
+    case "dispatchStart": {
+      const tabId = sender.tab?.id;
+      if (tabId === undefined) return { ok: false };
+      await addDispatchingTab(tabId);
+      await updateIcon(tabId);
+      return { ok: true };
+    }
+
+    case "dispatchEnd": {
+      const tabId = sender.tab?.id;
+      if (tabId === undefined) return { ok: false };
+      await removeDispatchingTab(tabId);
+      await updateIcon(tabId);
+      return { ok: true };
+    }
+
+    case "getSettings": {
+      return await getSettings();
+    }
+
+    case "setSettings": {
+      const patch = msg["settings"] as Partial<Settings>;
+      await setSettings(patch);
+      // Broadcast to claude.ai tabs.
+      const tabs = await chrome.tabs.query({ url: "https://claude.ai/*" });
+      const merged = await getSettings();
+      for (const tab of tabs) {
+        if (tab.id !== undefined) {
+          chrome.tabs
+            .sendMessage(tab.id, { type: "settingsChanged", autoSubmit: merged.autoSubmit })
+            .catch(() => {});
+        }
+      }
+      return { ok: true };
+    }
+
+    default:
+      return { error: `unknown message type: ${msg?.type}` };
+  }
+}
