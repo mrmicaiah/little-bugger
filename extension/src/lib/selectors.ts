@@ -37,15 +37,32 @@ function firstMatch<T extends Element>(
 }
 
 // The container that holds the streaming message turns. We attach the
-// MutationObserver here. claude.ai doesn't expose a single named landmark
-// for this — the turn-card divs DO have a stable data attribute, so we
-// reach the stream by going up one level.
+// MutationObserver here. claude.ai wraps each turn in its own
+// content-visibility virtualization div, so the first turn's parent is
+// NOT the container of subsequent turns — going up one level only would
+// cause us to miss every new turn added after init. Walk up to the
+// lowest common ancestor of all turn cards instead.
 export function findMessageStream(): Element | null {
-  const turnCard = document.querySelector("[data-test-render-count]");
-  if (turnCard?.parentElement) return turnCard.parentElement;
-  // Fallbacks if turn cards aren't present (empty conversation, etc.)
+  const turnCards = document.querySelectorAll<HTMLElement>("[data-test-render-count]");
+  if (turnCards.length >= 2) {
+    let candidate: Element | null = turnCards[0]!.parentElement;
+    while (candidate) {
+      let containsAll = true;
+      for (const tc of turnCards) {
+        if (!candidate.contains(tc)) {
+          containsAll = false;
+          break;
+        }
+      }
+      if (containsAll) return candidate;
+      candidate = candidate.parentElement;
+    }
+  }
+  // Fall back to body when we can't determine the LCA (zero or one turn
+  // card visible). Body is a stable always-present ancestor; the cost is
+  // extra mutation events to scan, which is fine for a single user.
   return firstMatch(document, [
-    { description: "role=main",   selector: "[role='main']" },
+    { description: "role=main",    selector: "[role='main']" },
     { description: "main element", selector: "main" },
     { description: "body",         selector: "body" },
   ], "message stream container");
