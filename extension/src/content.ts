@@ -82,7 +82,7 @@ async function init(): Promise<void> {
   const observer = new MutationObserver(handleMutations);
   observer.observe(stream, { childList: true, subtree: true, characterData: true });
 
-  console.log("[bugger] content script ready");
+  console.log(`[bugger] content script ready (observing <${stream.tagName.toLowerCase()}>)`);
 }
 
 async function waitForMessageStream(): Promise<Element | null> {
