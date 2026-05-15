@@ -1,5 +1,5 @@
-// Popup UI. Four states: daemon-unreachable, unbound, bound-idle,
-// bound-dispatching. Plus an inline settings pane (auto-submit toggle).
+// Popup UI. States: daemon-unreachable, unbound, bound-disarmed, bound-armed,
+// pending-result, settings.
 
 type Settings = { autoSubmit: boolean };
 type DaemonConfig = { projects: string[] };
@@ -43,7 +43,6 @@ async function refresh(): Promise<void> {
   }
   activeTabId = tab.id;
 
-  // Check daemon reachability first — gates everything else.
   const { reachable } = await send<{ reachable: boolean }>({ type: "isDaemonReachable", force: true });
   if (!reachable) {
     renderDaemonUnreachable();
@@ -60,10 +59,11 @@ async function refresh(): Promise<void> {
     return;
   }
 
-  const [bindingResp, configResp, pending] = await Promise.all([
+  const [bindingResp, configResp, pending, armedResp] = await Promise.all([
     send<{ project: string | null }>({ type: "getBinding", tabId: tab.id }),
     send<DaemonConfig | DaemonError>({ type: "getDaemonConfig" }),
     send<PendingResult | null>({ type: "getPendingForTab", tabId: tab.id }),
+    send<{ armed: boolean }>({ type: "getArmed", tabId: tab.id }),
   ]);
 
   if ("error" in configResp) {
@@ -77,7 +77,7 @@ async function refresh(): Promise<void> {
   }
 
   if (bindingResp.project) {
-    renderBound(tab.id, bindingResp.project, configResp);
+    renderBound(tab.id, bindingResp.project, configResp, armedResp.armed);
   } else {
     renderUnbound(tab.id, configResp);
   }
@@ -127,7 +127,6 @@ async function retrievePending(tabId: number, pending: PendingResult): Promise<v
     statusEl.innerHTML = `
       <div class="banner error">
         Could not reach the content script: ${escape((err as Error).message)}.
-        Make sure the tab is on claude.ai and try again.
       </div>
     `;
     btn.disabled = false;
@@ -224,11 +223,26 @@ function renderUnbound(tabId: number, config: DaemonConfig): void {
   });
 }
 
-function renderBound(tabId: number, project: string, config: DaemonConfig): void {
+function renderBound(
+  tabId: number,
+  project: string,
+  config: DaemonConfig,
+  armed: boolean,
+): void {
   const missing = !config.projects.includes(project);
   const projectsForDropdown = missing ? [project, ...config.projects] : config.projects;
 
+  // Arm state is the primary visual cue. Big primary button.
+  const armButton = armed
+    ? `<button id="disarm-btn" class="primary danger">DISARM</button>`
+    : `<button id="arm-btn" class="primary">ARM</button>`;
+
+  const armBanner = armed
+    ? `<div class="banner armed"><strong>ARMED</strong> — next PROMPT block dispatches.</div>`
+    : `<div class="banner"><strong>Disarmed</strong> — PROMPT blocks are ignored. Click ARM to enable.</div>`;
+
   render(`
+    ${armBanner}
     <div class="row">
       <div class="label">Bound to</div>
       <div class="value ${missing ? "missing" : ""}">${escape(project)}${missing ? " (missing from daemon config)" : ""}</div>
@@ -241,18 +255,47 @@ function renderBound(tabId: number, project: string, config: DaemonConfig): void
       </select>
     </div>
     <div class="controls">
+      ${armButton}
+      <button id="stop-btn" class="danger">Stop</button>
+    </div>
+    <div class="controls" style="margin-top:6px;">
       <button id="rebind-btn">Rebind</button>
       <button id="ping-btn" ${missing ? "disabled" : ""}>Ping worker</button>
     </div>
     <div id="ping-result" class="muted" style="margin-top:8px;"></div>
+    <div id="stop-result" class="muted" style="margin-top:4px;"></div>
   `);
 
-  // Rebind ALWAYS writes the binding, even when the selected project is the
-  // same as the currently-bound one. The whole point of the Rebind button is
-  // to FORCE a fresh write to storage — useful after state drift between
-  // popup display and content script state. Earlier this had an early-return
-  // on next === project which made the button a no-op for the single-project
-  // case (the common case when the user has just one project configured).
+  if (armed) {
+    document.getElementById("disarm-btn")!.addEventListener("click", async () => {
+      await send({ type: "setArmed", tabId, armed: false });
+      await refresh();
+    });
+  } else {
+    document.getElementById("arm-btn")!.addEventListener("click", async () => {
+      await send({ type: "setArmed", tabId, armed: true });
+      await refresh();
+    });
+  }
+
+  document.getElementById("stop-btn")!.addEventListener("click", async () => {
+    const resEl = document.getElementById("stop-result")!;
+    resEl.textContent = "Stopping…";
+    const resp = await send<{ ok?: boolean; error?: string; killed?: number; cleared?: number }>({
+      type: "stopAll",
+      tabId,
+    });
+    if (resp.ok) {
+      resEl.textContent = `Stopped. Cancelled ${resp.cleared ?? 0} job(s).`;
+    } else {
+      resEl.textContent = `Stop failed: ${resp.error ?? "unknown error"}`;
+    }
+    // Refresh to flip the arm button back.
+    await refresh();
+  });
+
+  // Rebind always writes — see commit history for why the early-return
+  // was removed.
   document.getElementById("rebind-btn")!.addEventListener("click", async () => {
     const select = document.getElementById("project-select") as HTMLSelectElement;
     const next = select.value;
@@ -278,7 +321,6 @@ async function runPing(project: string): Promise<void> {
     return;
   }
   const jobId = pingResp.jobId;
-  // Poll the job. Adaptive backoff matches content script.
   while (true) {
     const elapsed = Date.now() - t0;
     await new Promise((r) => setTimeout(r, elapsed < 10_000 ? 1000 : 3000));
@@ -342,7 +384,6 @@ function escape(s: string): string {
   });
 }
 
-// Re-render whenever the popup regains focus.
 window.addEventListener("focus", () => void refresh());
 
 void refresh();

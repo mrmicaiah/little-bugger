@@ -1,125 +1,230 @@
+/* Little Bugger popup */
+
 :root {
   --bg: #ffffff;
-  --fg: #1a1a1a;
-  --muted: #6b6b6b;
-  --border: #e0e0e0;
-  --accent: #2d6cdf;
-  --warn-bg: #fff4e6;
-  --warn-border: #ffb066;
-  --error-bg: #fdeaea;
-  --error-border: #e88;
-  --ok-bg: #eaf7ec;
-  --ok-border: #8c8;
-  --pending-bg: #f1ecff;
-  --pending-border: #9d82e8;
-  --button-bg: #f5f5f5;
-  --button-hover: #ebebeb;
+  --fg: #111111;
+  --muted: #666666;
+  --border: #e5e7eb;
+  --accent: #3b82f6;
+  --accent-fg: #ffffff;
+  --danger: #dc2626;
+  --danger-fg: #ffffff;
+  --warn-bg: #fef3c7;
+  --warn-border: #fbbf24;
+  --error-bg: #fee2e2;
+  --error-border: #f87171;
+  --pending-bg: #ede9fe;
+  --pending-border: #c4b5fd;
+  --armed-bg: #dcfce7;
+  --armed-border: #16a34a;
+  --armed-fg: #14532d;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #1a1a1a;
-    --fg: #f0f0f0;
-    --muted: #999;
-    --border: #333;
-    --accent: #5a8edf;
-    --warn-bg: #3a2a14;
-    --warn-border: #a47330;
-    --error-bg: #3a1a1a;
-    --error-border: #a44;
-    --ok-bg: #1a3a1f;
-    --ok-border: #4a7a4a;
-    --pending-bg: #2a1f44;
-    --pending-border: #6f55b8;
-    --button-bg: #2a2a2a;
-    --button-hover: #353535;
+    --bg: #1f2937;
+    --fg: #f3f4f6;
+    --muted: #9ca3af;
+    --border: #374151;
+    --accent: #60a5fa;
+    --accent-fg: #0b1220;
+    --danger: #ef4444;
+    --danger-fg: #ffffff;
+    --warn-bg: #423012;
+    --warn-border: #b45309;
+    --error-bg: #4c1414;
+    --error-border: #b91c1c;
+    --pending-bg: #2c2050;
+    --pending-border: #7c3aed;
+    --armed-bg: #14532d;
+    --armed-border: #22c55e;
+    --armed-fg: #dcfce7;
   }
 }
 
-* { box-sizing: border-box; }
-
-body {
+html, body {
   margin: 0;
   padding: 0;
-  width: 320px;
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-  font-size: 13px;
   background: var(--bg);
   color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  width: 320px;
 }
 
 header {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: space-between;
   padding: 10px 12px;
   border-bottom: 1px solid var(--border);
 }
 
-header .icon { font-size: 16px; }
-header .title { font-weight: 600; flex: 1; }
+header h1 {
+  font-size: 14px;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 
-main { padding: 12px; }
+header img {
+  width: 18px;
+  height: 18px;
+}
 
-.row { margin-bottom: 10px; }
-.label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
-.value { font-weight: 500; word-break: break-word; }
-.value.missing { color: var(--error-border); }
+.icon-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.icon-btn:hover {
+  background: var(--border);
+}
+
+#content {
+  padding: 12px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.label {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--muted);
+  flex: 0 0 90px;
+}
+
+.value {
+  font-weight: 600;
+}
+.value.missing {
+  color: var(--danger);
+}
+
+select {
+  flex: 1;
+  padding: 4px 6px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.controls {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+button {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+button:hover {
+  background: var(--border);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+button.primary {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+button.primary:hover {
+  filter: brightness(1.1);
+}
+button.danger {
+  background: var(--danger);
+  color: var(--danger-fg);
+  border-color: var(--danger);
+}
+button.danger:hover {
+  filter: brightness(1.1);
+}
+button.primary.danger {
+  /* When the primary action IS danger (e.g. DISARM): mix both. */
+  background: var(--danger);
+  color: var(--danger-fg);
+  border-color: var(--danger);
+}
+button.toggle {
+  flex: 0;
+  min-width: 50px;
+}
 
 .banner {
   padding: 8px 10px;
   border-radius: 4px;
   border: 1px solid var(--border);
-  margin-bottom: 10px;
+  margin: 4px 0;
   font-size: 12px;
+  line-height: 1.4;
 }
-.banner.warn { background: var(--warn-bg); border-color: var(--warn-border); }
-.banner.error { background: var(--error-bg); border-color: var(--error-border); }
-.banner.ok { background: var(--ok-bg); border-color: var(--ok-border); }
-.banner.pending { background: var(--pending-bg); border-color: var(--pending-border); }
-.banner code {
-  background: rgba(0, 0, 0, 0.08);
-  padding: 1px 4px;
-  border-radius: 2px;
+.banner.warn {
+  background: var(--warn-bg);
+  border-color: var(--warn-border);
+}
+.banner.error {
+  background: var(--error-bg);
+  border-color: var(--error-border);
+}
+.banner.pending {
+  background: var(--pending-bg);
+  border-color: var(--pending-border);
+}
+.banner.armed {
+  background: var(--armed-bg);
+  border-color: var(--armed-border);
+  color: var(--armed-fg);
+}
+
+.banner strong {
+  font-weight: 700;
+}
+
+.muted {
+  color: var(--muted);
   font-size: 11px;
 }
 
-select, button {
-  width: 100%;
-  padding: 7px 10px;
-  font-size: 13px;
-  border-radius: 4px;
-  border: 1px solid var(--border);
-  background: var(--button-bg);
-  color: var(--fg);
-  font-family: inherit;
-}
-
-button { cursor: pointer; }
-button:hover:not(:disabled) { background: var(--button-hover); }
-button:disabled { opacity: 0.5; cursor: not-allowed; }
-button.primary { background: var(--accent); color: white; border-color: var(--accent); }
-button.primary:hover:not(:disabled) { background: #1c5cd0; }
-button.ghost {
-  width: auto;
-  padding: 4px 8px;
-  background: transparent;
-  border: none;
-  font-size: 14px;
-}
-button.ghost:hover { background: var(--button-hover); }
-
-.controls { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
-.inline { display: flex; align-items: center; gap: 8px; }
-
-.muted { color: var(--muted); font-size: 11px; }
-
 .setting-row {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  padding: 6px 0;
+  justify-content: space-between;
+  padding: 8px 0;
   border-top: 1px solid var(--border);
 }
-.setting-row:first-child { border-top: none; }
-.toggle { width: auto; padding: 4px 10px; }
+
+pre {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: "SF Mono", "Consolas", monospace;
+  font-size: 11px;
+  overflow: auto;
+}
+code {
+  font-family: "SF Mono", "Consolas", monospace;
+  font-size: 11px;
+}

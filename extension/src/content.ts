@@ -9,6 +9,13 @@
 //
 // DISPATCH TAG: blocks tagged ```PROMPT (case-insensitive) are dispatched.
 // See selectors.ts for the rationale behind the tag choice.
+//
+// ARM STATE: every content script init starts DISARMED. The user must
+// explicitly click "Arm" in the popup before any dispatch fires. PROMPT
+// blocks detected while disarmed are marked seen and silently ignored.
+// This sidesteps the entire reload-re-dispatch problem: the system doesn't
+// have to guess whether a re-rendered block is historical or new, because
+// nothing fires unless the user said so.
 
 import {
   findMessageStream,
@@ -29,37 +36,19 @@ import * as statusPill from "./lib/statusPill.js";
 const DEBOUNCE_MS = 500;
 const STREAM_WAIT_MAX_MS = 30_000;
 
-// Dispatched block ids → in-flight job ids. Prevents re-dispatching the same
-// block when MO fires multiple times for it.
 const dispatchedBlocks = new Map<string, string>();
-
-// Debounce timers keyed by the block DOM node.
 const blockDebouncers = new WeakMap<Element, ReturnType<typeof setTimeout>>();
-
-// Content-level dedupe. claude.ai sometimes renders the same PROMPT block
-// as multiple DOM elements (edit history, regenerated responses,
-// virtualization clones). Each DOM copy is a distinct Element so the
-// per-block data-bugger-handled marker doesn't dedupe across them, and
-// the blockId-based dedupe varies because blockIndex/ordinal differ per
-// copy. Hashing the prompt content alone fixes both — same prompt in this
-// tab dispatches exactly once. Set is per-content-script (per-tab), reset
-// on tab reload, which is the intended behavior.
 const dispatchedContent = new Set<string>();
 
-// Single-flight gate. With body-level MO + claude.ai's heavy streaming
-// re-renders, dozens of tryDispatch promises can stack up — even with
-// content dedupe, slight text variations across renders sneak past it.
-// This gate ensures at most one dispatch is being processed at a time;
-// late arrivals reschedule and re-evaluate after the current one finishes.
 let dispatchInFlight = false;
-
-// Monotonic counter for assigning ordinals to assistant messages we observe.
-// Pre-existing messages get sequential ordinals during init; new messages get
-// the next one when first encountered.
 let messageOrdinalCounter = 0;
-
 let myTabBinding: string | null = null;
 let autoSubmit = true;
+
+// ARM state. Starts FALSE on every content script init. The SW will tell
+// us when the user clicks Arm in the popup (via the "armChanged" message)
+// and when the user clicks Disarm or Stop.
+let armed = false;
 
 // --- bootstrap --------------------------------------------------------------
 
@@ -78,7 +67,14 @@ async function init(): Promise<void> {
     autoSubmit = true;
   }
 
-  // Listen for binding / settings updates and popup-driven requests.
+  // Force-disarm on every page load. Whatever was in storage from before,
+  // we override here. This is the central guarantee of the arm/disarm
+  // design: NO dispatches until the user explicitly clicks Arm AFTER this
+  // page loaded.
+  armed = false;
+  await chrome.runtime.sendMessage({ type: "forceDisarmMe" }).catch(() => {});
+
+  // Listen for binding / settings / arm updates and popup-driven requests.
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg?.type === "bindingChanged") {
       myTabBinding = msg.project ?? null;
@@ -86,6 +82,11 @@ async function init(): Promise<void> {
     }
     if (msg?.type === "settingsChanged") {
       autoSubmit = msg.autoSubmit ?? true;
+      return;
+    }
+    if (msg?.type === "armChanged") {
+      armed = msg.armed === true;
+      console.log(`[bugger] arm state: ${armed ? "ARMED" : "disarmed"}`);
       return;
     }
     if (msg?.type === "checkInputClear") {
@@ -96,6 +97,16 @@ async function init(): Promise<void> {
       }
       const clear = readEditorContent(input).trim().length === 0;
       sendResponse({ clear });
+      return;
+    }
+    if (msg?.type === "clearInput") {
+      const input = findInputTextarea();
+      if (!input) {
+        sendResponse({ ok: false, error: "input not found" });
+        return;
+      }
+      clearEditorContent(input);
+      sendResponse({ ok: true });
       return;
     }
     if (msg?.type === "injectPending") {
@@ -118,15 +129,15 @@ async function init(): Promise<void> {
     return;
   }
 
-  // Initial scan: assign ordinals and mark all pre-existing PROMPT blocks as
-  // seen so we never re-dispatch historical content.
+  // Initial scan: mark all pre-existing PROMPT blocks as seen. Since we're
+  // also disarmed, even if scan misses some they'd be ignored on detection.
   scanInitial();
 
   // Attach the observer.
   const observer = new MutationObserver(handleMutations);
   observer.observe(stream, { childList: true, subtree: true, characterData: true });
 
-  console.log(`[bugger] content script ready (observing <${stream.tagName.toLowerCase()}>)`);
+  console.log(`[bugger] content script ready (observing <${stream.tagName.toLowerCase()}>, disarmed)`);
 }
 
 async function waitForMessageStream(): Promise<Element | null> {
@@ -144,7 +155,6 @@ function scanInitial(): void {
   for (const msg of messages) {
     getOrAssignMessageOrdinal(msg);
     for (const block of findBuggerBlocks(msg)) {
-      // Mark as seen WITHOUT dispatching — these are history.
       block.setAttribute("data-bugger-handled", "init-scan");
     }
   }
@@ -156,24 +166,16 @@ function handleMutations(mutations: MutationRecord[]): void {
   const blocksToCheck = new Set<Element>();
 
   for (const mut of mutations) {
-    // Added nodes: could be a new message OR new content within a message.
     for (const node of mut.addedNodes) {
       if (node.nodeType !== Node.ELEMENT_NODE) continue;
       const el = node as Element;
-      // If a new assistant message appeared, assign its ordinal now.
       const newMessages = isAssistantMessage(el) ? [el] : findAssistantMessages(el);
       for (const m of newMessages) getOrAssignMessageOrdinal(m);
-      // Any new PROMPT blocks inside?
       const newBlocks = isCodeBlock(el)
         ? findBuggerBlocksMatchingNode(el)
         : findBuggerBlocksIn(el);
       for (const b of newBlocks) blocksToCheck.add(b);
     }
-    // CharacterData / subtree changes: re-check the containing PROMPT
-    // wrapper, IF this mutation is inside one. Earlier this used
-    // closest("pre") which matched any of the 300+ code blocks on the
-    // page — every keystroke churn re-fired the dispatch path on
-    // unrelated pres.
     if (mut.target.nodeType === Node.ELEMENT_NODE) {
       const target = mut.target as Element;
       const wrapper = target.closest('[aria-label="PROMPT code" i]');
@@ -187,8 +189,6 @@ function handleMutations(mutations: MutationRecord[]): void {
 }
 
 function isAssistantMessage(el: Element): boolean {
-  // claude.ai marks each assistant turn with data-is-streaming (value
-  // "true" or "false"). selectors.ts uses the same anchor.
   return el.matches?.("[data-is-streaming]") || false;
 }
 
@@ -197,13 +197,11 @@ function isCodeBlock(el: Element): boolean {
 }
 
 function findBuggerBlocksIn(root: Element): Element[] {
-  // root might be a message turn, a wrapper, anything — defer to selector lib.
   const candidate = root.closest("[data-is-streaming]") ?? root;
   return findBuggerBlocks(candidate);
 }
 
 function findBuggerBlocksMatchingNode(el: Element): Element[] {
-  // The added node IS a pre/code — check if it's a PROMPT block.
   const message = findContainingMessage(el);
   if (!message) return [];
   const blocks = findBuggerBlocks(message);
@@ -211,13 +209,11 @@ function findBuggerBlocksMatchingNode(el: Element): Element[] {
 }
 
 function scheduleBlockCheck(block: Element): void {
-  if (block.getAttribute("data-bugger-handled")) return; // already dispatched or seen
+  if (block.getAttribute("data-bugger-handled")) return;
 
   const existing = blockDebouncers.get(block);
   if (existing) clearTimeout(existing);
 
-  // Speed-up: if the containing message is no longer streaming, we can
-  // dispatch sooner. Still wait one short tick to let DOM settle.
   const message = findContainingMessage(block);
   const fastPath = message && !isMessageStillStreaming(message);
   const delay = fastPath ? 100 : DEBOUNCE_MS;
@@ -236,48 +232,39 @@ async function tryDispatch(block: Element): Promise<void> {
 
   const message = findContainingMessage(block);
   if (!message) {
-    // Can't compute an id without a containing message; defer.
     scheduleBlockCheck(block);
     return;
   }
 
-  // Refinement A precondition (1): block content must be non-empty and look
-  // like a closed code block. claude.ai strips the literal ``` fences during
-  // markdown rendering, so the structural signal is: the <pre> element exists
-  // with content, and the message turn either has more content AFTER the
-  // block OR has stopped streaming. The 500ms debounce (in scheduleBlockCheck)
-  // is the load-bearing piece — this content check is the cheap pre-filter.
   const content = extractBlockContent(block).replace(/\s+$/, "");
   if (!content) return;
 
-  // Refinement A precondition (2): if still streaming, re-arm and wait.
   if (isMessageStillStreaming(message)) {
     scheduleBlockCheck(block);
     return;
   }
 
-  // If the block is the LAST element in the message and streaming just
-  // stopped, we still want a brief settle window in case another mutation
-  // arrives. The fast-path delay above (100ms) provides this.
+  // ARM GATE — the central safety. If disarmed, mark the block seen and
+  // bail. The block won't be re-checked unless the page is re-rendered and
+  // produces a new DOM element, at which point this same check will
+  // re-fire and re-bail.
+  if (!armed) {
+    block.setAttribute("data-bugger-handled", "disarmed");
+    dispatchedContent.add(content);
+    return;
+  }
 
   if (!myTabBinding) {
-    // Not bound — surface in console, don't auto-inject (could confuse user
-    // mid-conversation). Popup will surface this state.
     console.warn("[bugger] block detected but tab not bound to any project; ignoring");
     block.setAttribute("data-bugger-handled", "unbound");
     return;
   }
 
-  // Content-level dedupe. Synchronous check+add: no await between them,
-  // so concurrent tryDispatches for DOM copies of the same prompt can't
-  // race past this guard. See comment on `dispatchedContent` above.
   if (dispatchedContent.has(content)) {
     block.setAttribute("data-bugger-handled", "duplicate-content");
     return;
   }
 
-  // Single-flight gate. If something is already being dispatched,
-  // reschedule this block and let the in-flight one finish first.
   if (dispatchInFlight) {
     scheduleBlockCheck(block);
     return;
@@ -312,8 +299,6 @@ async function tryDispatch(block: Element): Promise<void> {
     const jobId = dispatchResult.jobId;
     dispatchedBlocks.set(blockId, jobId);
 
-    // Live status updates: re-render the pill whenever the daemon's reported
-    // phase changes. Same text → no DOM update; the show() helper skips it.
     let lastPhaseKey: string | undefined;
     const job = await pollJob(jobId, (snapshot) => {
       const phaseKey = `${snapshot.phase ?? ""}|${snapshot.phaseDetail ?? ""}`;
@@ -339,8 +324,6 @@ async function tryDispatch(block: Element): Promise<void> {
     block.setAttribute("data-bugger-handled", "completed");
   } finally {
     dispatchInFlight = false;
-    // Pill stays visible briefly after the result lands, then fades.
-    // Guaranteed to fire even on early-return or thrown paths.
     statusPill.hideAfter(2000);
   }
 }
@@ -378,7 +361,6 @@ async function computeBlockId(
   blockIndex: number,
   messageOrdinal: number,
 ): Promise<string> {
-  // Refinement C: sha1(content + indexOfBlockWithinMessage + sequentialMessageOrdinal).
   const data = new TextEncoder().encode(`${content} ${blockIndex} ${messageOrdinal}`);
   const buf = await crypto.subtle.digest("SHA-1", data);
   return Array.from(new Uint8Array(buf))
@@ -398,11 +380,10 @@ async function pollJob(
     const delay = elapsed < 10_000 ? 1000 : 3000;
     await sleep(delay);
     const result = await daemon.getJob(jobId);
-    if (result === null) return null; // daemon unreachable
+    if (result === null) return null;
     if (daemon.isDaemonError(result)) return result;
     if (onSnapshot) onSnapshot(result);
     if (result.status === "succeeded" || result.status === "failed") return result;
-    // queued / running — keep polling
   }
 }
 
@@ -431,8 +412,6 @@ function formatErrorInjection(message: string, status: number): string {
 // --- injection --------------------------------------------------------------
 
 async function injectResult(job: Job): Promise<boolean> {
-  // Successful worker results may auto-submit (if the user has the toggle on).
-  // Pass jobId+project so the guard path can record a pending result.
   return await injectText(formatResult(job), {
     allowAutoSubmit: true,
     pending: { jobId: job.id, project: job.project },
@@ -440,11 +419,6 @@ async function injectResult(job: Job): Promise<boolean> {
 }
 
 async function injectErrorMessage(message: string, status: number): Promise<void> {
-  // Errors NEVER auto-submit. The user should see and acknowledge a
-  // dispatch failure before it goes back to the manager — otherwise
-  // transient failures (daemon restart, network blip) flood the chat
-  // with noise the manager has to talk past.
-  // No pending param: error-path injections never create pending state.
   await injectText(formatErrorInjection(message, status), { allowAutoSubmit: false });
 }
 
@@ -458,10 +432,6 @@ async function injectText(
     return false;
   }
 
-  // Safety: don't stomp the user's draft text. If the input has any
-  // non-whitespace content (a worker result already sitting there, or
-  // typing in progress), abort. The user clears the input on their own
-  // terms and can ask the manager to re-dispatch if needed.
   const existing = readEditorContent(input).trim();
   if (existing.length > 0) {
     console.warn(
@@ -469,7 +439,6 @@ async function injectText(
         `clear the input manually before the next dispatch`,
     );
     if (opts.pending) {
-      // Surface the orphaned result so the user can retrieve it from the popup.
       await chrome.runtime
         .sendMessage({
           type: "pendingResult",
@@ -482,11 +451,11 @@ async function injectText(
   }
 
   if (!performInject(input, text)) {
-    return false; // performInject already logged the failure
+    return false;
   }
 
   if (autoSubmit && opts.allowAutoSubmit) {
-    await sleep(100); // let React reconcile state
+    await sleep(100);
     const send = findSendButton();
     if (!send) {
       console.warn("[bugger] auto-submit on but send button not found; user will need to click Send");
@@ -498,20 +467,10 @@ async function injectText(
 }
 
 function performInject(input: HTMLElement, text: string): boolean {
-  // Single-path injection. We used to also run an execCommand fallback when
-  // a 75ms verification check decided the InputEvent path "didn't take" —
-  // but that check produced false negatives, the fallback fired anyway, and
-  // ProseMirror absorbed BOTH insertions (the modern one as inline-collapsed
-  // text + the execCommand one as a real multi-line code block), submitting
-  // the worker result doubled in a single message. The modern path is
-  // verified to work end-to-end on production claude.ai; if it ever stops
-  // working, add a real retry — don't pre-emptively double-inject.
   input.focus();
   try {
     const isTextarea = input.tagName === "TEXTAREA" || input.tagName === "INPUT";
     if (isTextarea) {
-      // For native textareas, set value via the native setter (bypasses React
-      // value tracker) then fire input event.
       const ta = input as HTMLTextAreaElement;
       const proto = Object.getPrototypeOf(ta);
       const nativeSetter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
@@ -522,9 +481,6 @@ function performInject(input: HTMLElement, text: string): boolean {
       }
       ta.dispatchEvent(new Event("input", { bubbles: true }));
     } else {
-      // Contenteditable (ProseMirror): insert at end via Range API and
-      // dispatch beforeinput + input events so the editor's state controller
-      // sees the change.
       const selection = window.getSelection();
       if (selection) {
         selection.removeAllRanges();
@@ -566,6 +522,35 @@ function readEditorContent(input: HTMLElement): string {
     return (input as HTMLTextAreaElement).value ?? "";
   }
   return input.innerText ?? input.textContent ?? "";
+}
+
+function clearEditorContent(input: HTMLElement): void {
+  input.focus();
+  if (input.tagName === "TEXTAREA" || input.tagName === "INPUT") {
+    const ta = input as HTMLTextAreaElement;
+    const proto = Object.getPrototypeOf(ta);
+    const nativeSetter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (nativeSetter) nativeSetter.call(ta, "");
+    else ta.value = "";
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    return;
+  }
+  // contenteditable: select all, delete
+  const selection = window.getSelection();
+  if (selection) {
+    selection.removeAllRanges();
+    const range = document.createRange();
+    range.selectNodeContents(input);
+    selection.addRange(range);
+  }
+  input.dispatchEvent(
+    new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "deleteContentBackward" }),
+  );
+  // Manual clear as a fallback for editors that don't honor beforeinput.
+  while (input.firstChild) input.removeChild(input.firstChild);
+  input.dispatchEvent(
+    new InputEvent("input", { bubbles: true, cancelable: true, inputType: "deleteContentBackward" }),
+  );
 }
 
 // --- utilities --------------------------------------------------------------

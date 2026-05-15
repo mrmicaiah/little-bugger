@@ -1,7 +1,7 @@
 // Service worker. Kept deliberately small — MV3's SW sleeps after ~30s idle.
 // Responsibilities:
-//   - icon updates per tab (binding state × daemon reachability × dispatch state)
-//   - proxy daemon endpoints the popup needs (config, ping)
+//   - icon updates per tab (binding state × daemon reachability × dispatch state × arm state)
+//   - proxy daemon endpoints the popup needs (config, ping, clear)
 //   - tab cleanup on close (storage hygiene)
 //   - light /health cache (10s TTL) to avoid hammering the daemon
 
@@ -18,6 +18,8 @@ import {
   getPendingResult,
   setPendingResult,
   clearPendingResult,
+  getArmed,
+  setArmed,
   type Settings,
 } from "./lib/tabBinding.js";
 
@@ -55,6 +57,16 @@ async function updateBadge(tabId: number, state: IconState): Promise<void> {
   } else if (state === "purple") {
     text = "!";
     color = "#7c4dff";
+  } else if (state === "green") {
+    // Show arm state on the green icon: "ARM" badge means armed (ready to fire),
+    // no badge means disarmed (the safe default). The wording is
+    // counterintuitive at first — "ARM" sounds like a warning — but it matches
+    // the popup button label so the meaning carries over.
+    const armed = await getArmed(tabId);
+    if (armed) {
+      text = "ARM";
+      color = "#16a34a"; // green-600
+    }
   }
   try {
     await chrome.action.setBadgeText({ tabId, text });
@@ -111,8 +123,6 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  // chrome.storage.session is cleared on browser restart; nothing to clean.
-  // Just refresh icons.
   void updateAllVisibleIcons();
 });
 
@@ -153,10 +163,7 @@ async function handleMessage(
       }
       await setBinding(tabId, project);
       await updateIcon(tabId);
-      // Notify the content script in that tab.
-      chrome.tabs.sendMessage(tabId, { type: "bindingChanged", project }).catch(() => {
-        // Content script may not be loaded yet — harmless.
-      });
+      chrome.tabs.sendMessage(tabId, { type: "bindingChanged", project }).catch(() => {});
       return { ok: true };
     }
 
@@ -210,7 +217,6 @@ async function handleMessage(
     case "setSettings": {
       const patch = msg["settings"] as Partial<Settings>;
       await setSettings(patch);
-      // Broadcast to claude.ai tabs.
       const tabs = await chrome.tabs.query({ url: "https://claude.ai/*" });
       const merged = await getSettings();
       for (const tab of tabs) {
@@ -222,6 +228,51 @@ async function handleMessage(
       }
       return { ok: true };
     }
+
+    // --- ARM / DISARM / STOP -----------------------------------------------
+
+    case "forceDisarmMe": {
+      // Called by content script on init. Always wipe stored arm state for
+      // this tab so a reload starts disarmed.
+      const tabId = sender.tab?.id;
+      if (tabId === undefined) return { ok: false };
+      await setArmed(tabId, false);
+      await updateIcon(tabId);
+      return { ok: true };
+    }
+
+    case "getArmed": {
+      const tabId = typeof msg["tabId"] === "number" ? (msg["tabId"] as number) : sender.tab?.id;
+      if (tabId === undefined) return { armed: false };
+      return { armed: await getArmed(tabId) };
+    }
+
+    case "setArmed": {
+      const tabId = typeof msg["tabId"] === "number" ? (msg["tabId"] as number) : sender.tab?.id;
+      const armed = msg["armed"] === true;
+      if (tabId === undefined) return { error: "tabId required" };
+      await setArmed(tabId, armed);
+      await updateIcon(tabId);
+      chrome.tabs.sendMessage(tabId, { type: "armChanged", armed }).catch(() => {});
+      return { ok: true };
+    }
+
+    case "stopAll": {
+      // Big red button: clear daemon job queue + disarm current tab.
+      const tabId = typeof msg["tabId"] === "number" ? (msg["tabId"] as number) : sender.tab?.id;
+      const clearResult = await daemon.clearJobs();
+      if (tabId !== undefined) {
+        await setArmed(tabId, false);
+        await updateIcon(tabId);
+        chrome.tabs.sendMessage(tabId, { type: "armChanged", armed: false }).catch(() => {});
+      }
+      if (daemon.isDaemonError(clearResult)) {
+        return { ok: false, error: clearResult.error };
+      }
+      return { ok: true, killed: clearResult.killed, cleared: clearResult.cleared };
+    }
+
+    // --- Pending result ----------------------------------------------------
 
     case "pendingResult": {
       const tabId = sender.tab?.id;
@@ -248,18 +299,13 @@ async function handleMessage(
       if (!pending) return { error: "no pending result" };
       const job = await daemon.getJob(pending.jobId);
       if (job === null) {
-        // Daemon unreachable — don't clear pending; user can retry later.
         return { error: "daemon unreachable" };
       }
       if (daemon.isDaemonError(job)) {
-        // Job is gone from the daemon (e.g., daemon restarted, TTL). Clear
-        // pending so the icon goes back to green.
         await clearPendingResult(tabId);
         await updateIcon(tabId);
         return { error: job.error };
       }
-      // Hand the job to the popup but don't clear yet — popup confirms after
-      // a successful inject.
       return { job };
     }
 
