@@ -6,6 +6,7 @@ export type Config = {
   projects: Record<string, string>;
   anthropic_api_key: string;
   port: number;
+  max_turns: number;
 };
 
 let currentConfig: Config | null = null;
@@ -26,6 +27,7 @@ const BOOTSTRAP_STUB = {
   projects: {},
   anthropic_api_key: "",
   port: 8765,
+  max_turns: 200,
 };
 
 export function ensureConfigFile(): { path: string; bootstrapped: boolean } {
@@ -93,12 +95,22 @@ function parseAndValidate(raw: string, configPath: string): Config {
     portValidated = port;
   }
 
+  const maxTurns = obj["max_turns"];
+  let maxTurnsValidated = 200;
+  if (maxTurns !== undefined) {
+    if (typeof maxTurns !== "number" || !Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 1000) {
+      throw new Error(`${configPath}: "max_turns" must be an integer between 1 and 1000`);
+    }
+    maxTurnsValidated = maxTurns;
+  }
+
   // Unknown top-level keys (e.g. `_comment`) are silently ignored.
 
   return {
     projects: projectsValidated,
     anthropic_api_key: typeof apiKey === "string" ? apiKey : "",
     port: portValidated,
+    max_turns: maxTurnsValidated,
   };
 }
 
@@ -150,6 +162,7 @@ function logReloadDiff(prev: Config | null, next: Config): void {
   const nextKey = next.anthropic_api_key;
   if (!prevKey && nextKey) parts.push("api_key: set");
   if (prevKey && !nextKey) parts.push("api_key: cleared");
+  if (prev && prev.max_turns !== next.max_turns) parts.push(`max_turns: ${prev.max_turns} → ${next.max_turns}`);
   console.log(`[config] reloaded${parts.length ? " — " + parts.join("; ") : ""}`);
 }
 
