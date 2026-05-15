@@ -33,6 +33,7 @@ export type Job = {
 
 export type DispatchOk = { jobId: string };
 export type DaemonError = { error: string; status: number };
+export type ClearOk = { ok: true; killed: number; cleared: number };
 
 export async function health(): Promise<DaemonHealth | null> {
   try {
@@ -102,6 +103,26 @@ export async function ping(project: string): Promise<DispatchOk | DaemonError> {
       return { error: typeof body["error"] === "string" ? body["error"] : "unknown error", status: res.status };
     }
     return { jobId: String(body["jobId"]) };
+  } catch (err) {
+    return { error: `daemon unreachable: ${(err as Error).message}`, status: 0 };
+  }
+}
+
+// POST /jobs/clear — ask the daemon to cancel all queued/running jobs and
+// kill any active Claude Code child processes. Used by the popup's Stop
+// button. Idempotent; calling on an empty queue is a no-op.
+export async function clearJobs(): Promise<ClearOk | DaemonError> {
+  try {
+    const res = await fetch(`${BASE}/jobs/clear`, { method: "POST" });
+    const body = (await res.json()) as Record<string, unknown>;
+    if (!res.ok) {
+      return { error: typeof body["error"] === "string" ? body["error"] : "unknown error", status: res.status };
+    }
+    return {
+      ok: true,
+      killed: typeof body["killed"] === "number" ? body["killed"] : 0,
+      cleared: typeof body["cleared"] === "number" ? body["cleared"] : 0,
+    };
   } catch (err) {
     return { error: `daemon unreachable: ${(err as Error).message}`, status: 0 };
   }

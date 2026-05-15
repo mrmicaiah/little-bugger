@@ -4,7 +4,7 @@ import { addRoute, createServer } from "./http.js";
 import { healthHandler } from "./routes/health.js";
 import { configHandler } from "./routes/config.js";
 import { dispatchHandler } from "./routes/dispatch.js";
-import { jobHandler } from "./routes/jobs.js";
+import { jobHandler, jobsClearHandler } from "./routes/jobs.js";
 import { pingHandler } from "./routes/ping.js";
 import { killAllActive } from "./claudeCode.js";
 
@@ -40,6 +40,7 @@ async function main(): Promise<void> {
   addRoute("GET", "/config", configHandler);
   addRoute("POST", "/dispatch", dispatchHandler, { needsBody: true });
   addRoute("GET", "/jobs/:id", jobHandler);
+  addRoute("POST", "/jobs/clear", jobsClearHandler);
   addRoute("POST", "/ping", pingHandler, { needsBody: true });
 
   const port = getConfig().port;

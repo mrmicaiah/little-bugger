@@ -1,5 +1,5 @@
 import { sendJson, type Handler } from "../http.js";
-import { getJob } from "../jobs.js";
+import { getJob, clearAllJobs } from "../jobs.js";
 
 export const jobHandler: Handler = ({ res, params }) => {
   const id = params["id"];
@@ -27,4 +27,11 @@ export const jobHandler: Handler = ({ res, params }) => {
   if (job.phase !== undefined) out["phase"] = job.phase;
   if (job.phaseDetail !== undefined) out["phaseDetail"] = job.phaseDetail;
   sendJson(res, 200, out);
+};
+
+// POST /jobs/clear — cancel all queued and running jobs, kill active
+// Claude Code child processes. Used by the popup's Stop button.
+export const jobsClearHandler: Handler = ({ res }) => {
+  const { killed, cleared } = clearAllJobs();
+  sendJson(res, 200, { ok: true, killed, cleared });
 };

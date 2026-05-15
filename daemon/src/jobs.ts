@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { runClaudeCode } from "./claudeCode.js";
 import { captureDiff } from "./gitDiff.js";
 import { getConfig, getProjectPath } from "./config.js";
+import { killAllActive } from "./claudeCode.js";
 
 export type JobStatus = "queued" | "running" | "succeeded" | "failed";
 
@@ -33,9 +34,6 @@ export type Job = {
 
 // NO PERSISTENCE — by design. All state below is in-memory and fresh on every
 // daemon startup. See SPEC.md §"Job execution" and §"What's out of scope for v0".
-// Future-us: don't add recovery here. The chat is the record of what was
-// dispatched and what came back; a missing job after restart surfaces as
-// "daemon unreachable" in the extension and the user retries.
 const jobsById = new Map<string, Job>();
 const perProjectQueue = new Map<string, Job[]>();
 
@@ -68,6 +66,11 @@ async function runNext(project: string): Promise<void> {
   const queue = perProjectQueue.get(project);
   if (!queue || queue.length === 0) return;
   const job = queue[0]!;
+  // If the job was cancelled while queued, just advance past it.
+  if (job.status === "failed") {
+    drainAndAdvance(project);
+    return;
+  }
   job.status = "running";
   job.startedAt = Date.now();
   console.log(`[job] start id=${job.id} project=${project}`);
@@ -144,4 +147,37 @@ function drainAndAdvance(project: string): void {
 
 export function getJob(id: string): Job | undefined {
   return jobsById.get(id);
+}
+
+// Clear all jobs across all projects. Kills any active Claude Code child
+// processes, marks every queued and running job as failed (so polls return
+// a clean error), and empties the per-project queues. Used by the Stop
+// button in the popup.
+export function clearAllJobs(): { killed: number; cleared: number } {
+  let killed = 0;
+  let cleared = 0;
+
+  // Mark every non-terminal job as failed/cancelled so anyone polling them
+  // gets a definitive answer.
+  for (const job of jobsById.values()) {
+    if (job.status === "queued" || job.status === "running") {
+      job.status = "failed";
+      job.error = "cancelled by user";
+      job.endedAt = Date.now();
+      job.phase = "done";
+      job.phaseDetail = undefined;
+      cleared++;
+      if (job.status === "failed") killed++;
+    }
+  }
+
+  // Drop all queues. Any runNext loops in flight will see queue.length===0
+  // on their next drainAndAdvance and stop cleanly.
+  perProjectQueue.clear();
+
+  // Kill any live Claude Code child processes.
+  killAllActive();
+
+  console.log(`[clear] cancelled ${cleared} job(s), killed active children`);
+  return { killed, cleared };
 }

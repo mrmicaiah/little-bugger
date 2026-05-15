@@ -4,6 +4,7 @@
 
 const STORAGE_KEY_PREFIX = "binding:";
 const PENDING_KEY_PREFIX = "pending:";
+const ARMED_KEY_PREFIX = "armed:";
 const SETTINGS_KEY = "settings";
 const DISPATCHING_TABS_KEY = "dispatching-tabs";
 
@@ -29,6 +30,10 @@ function pendingKey(tabId: number): string {
   return `${PENDING_KEY_PREFIX}${tabId}`;
 }
 
+function armedKey(tabId: number): string {
+  return `${ARMED_KEY_PREFIX}${tabId}`;
+}
+
 export async function getBinding(tabId: number): Promise<string | null> {
   const key = bindingKey(tabId);
   const result = await chrome.storage.session.get(key);
@@ -41,7 +46,7 @@ export async function setBinding(tabId: number, project: string): Promise<void> 
 }
 
 export async function clearBinding(tabId: number): Promise<void> {
-  await chrome.storage.session.remove([bindingKey(tabId), pendingKey(tabId)]);
+  await chrome.storage.session.remove([bindingKey(tabId), pendingKey(tabId), armedKey(tabId)]);
 }
 
 export async function getPendingResult(tabId: number): Promise<PendingResult | null> {
@@ -73,9 +78,34 @@ export async function clearPendingResult(tabId: number): Promise<void> {
   await chrome.storage.session.remove(pendingKey(tabId));
 }
 
-// chrome.storage.session also persists settings across SW restarts within a
-// session. Settings reset to defaults on browser restart, which is fine —
-// they're trivial.
+// --- Arm state -------------------------------------------------------------
+//
+// Armed = the tab will dispatch when PROMPT blocks are detected.
+// Disarmed = PROMPT blocks are detected and ignored.
+//
+// DEFAULT IS DISARMED. Every page load starts disarmed. The user must
+// explicitly click "Arm" in the popup before any dispatch fires. This is
+// the central design choice: no more guessing whether a re-rendered block
+// is historical or new — the system just doesn't fire unless armed.
+//
+// Armed state is keyed by tab id and stored in chrome.storage.session, so it
+// survives within the same browser session if the user navigates within the
+// tab, but a hard reload of the tab re-creates the same tab id and the state
+// IS preserved — which is FINE, because content script init does NOT trust
+// the stored armed state; it explicitly clears it on init. See content.ts.
+
+export async function getArmed(tabId: number): Promise<boolean> {
+  const key = armedKey(tabId);
+  const result = await chrome.storage.session.get(key);
+  return result[key] === true;
+}
+
+export async function setArmed(tabId: number, armed: boolean): Promise<void> {
+  await chrome.storage.session.set({ [armedKey(tabId)]: armed });
+}
+
+// --- Settings --------------------------------------------------------------
+
 export async function getSettings(): Promise<Settings> {
   const result = await chrome.storage.session.get(SETTINGS_KEY);
   const stored = result[SETTINGS_KEY];
