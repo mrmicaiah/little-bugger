@@ -28,7 +28,6 @@ import * as statusPill from "./lib/statusPill.js";
 
 const DEBOUNCE_MS = 500;
 const STREAM_WAIT_MAX_MS = 30_000;
-const BINDING_WAIT_MAX_MS = 10_000;
 
 // Dispatched block ids → in-flight job ids. Prevents re-dispatching the same
 // block when MO fires multiple times for it.
@@ -44,69 +43,36 @@ const blockDebouncers = new WeakMap<Element, ReturnType<typeof setTimeout>>();
 // per-content-script (per-tab), reset on tab reload.
 const dispatchedContent = new Set<string>();
 
-// Single-flight gate. With body-level MO + claude.ai's heavy streaming
-// re-renders, dozens of tryDispatch promises can stack up — even with
-// content dedupe, slight text variations across renders sneak past it.
-// This gate ensures at most one dispatch is being processed at a time;
-// late arrivals reschedule and re-evaluate after the current one finishes.
+// Single-flight gate.
 let dispatchInFlight = false;
 
 // Monotonic counter for assigning ordinals to assistant messages we observe.
-// Pre-existing messages get sequential ordinals during init; new messages get
-// the next one when first encountered.
 let messageOrdinalCounter = 0;
 
 let myTabBinding: string | null = null;
-let myTabId: number | null = null;
 let autoSubmit = true;
 
-// Init-scan flag. After scanInitial runs, this stays true forever. We use it
-// as the "did we already complete the initial sweep?" signal. Any PROMPT
-// block tryDispatch ever sees must have either been seen by scanInitial
-// (marked init-scan) OR appeared in a mutation after init. If neither — i.e.
-// we see an unmarked block BEFORE init completes — we defer rather than
-// dispatch, so the init scan can sweep and mark it as historical.
+// Init-scan flag.
 let initScanComplete = false;
 
 // --- bootstrap --------------------------------------------------------------
 
 async function init(): Promise<void> {
-  // Get our own tab id from the SW (we need it as a chrome.storage.session key).
-  // Tab id never changes during a tab's lifetime, so cache once.
+  // Get binding and settings from the service worker. This was the original
+  // working path. An earlier refactor tried reading storage directly and
+  // broke the binding path entirely — restored.
   try {
-    const tabResp = await chrome.runtime.sendMessage({ type: "whoAmI" });
-    myTabId = typeof tabResp?.tabId === "number" ? tabResp.tabId : null;
+    const bindingResp = await chrome.runtime.sendMessage({ type: "getBindingForMe" });
+    myTabBinding = bindingResp?.project ?? null;
   } catch {
-    myTabId = null;
+    myTabBinding = null;
   }
-
-  // Read binding and settings DIRECTLY from chrome.storage.session — no SW
-  // round-trip. The earlier SW-mediated path failed silently if the SW was
-  // asleep at script init, leaving myTabBinding as null indefinitely (the
-  // user would see "Bound to: X" in the popup but the content script
-  // wouldn't dispatch).
-  await loadBindingFromStorage();
-  await loadSettingsFromStorage();
-
-  // Watch storage so the content script reflects changes immediately even
-  // if the popup or SW updated them while we weren't looking.
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== "session") return;
-    if (myTabId !== null) {
-      const bindingKey = `binding:${myTabId}`;
-      if (bindingKey in changes) {
-        const newValue = changes[bindingKey]?.newValue;
-        myTabBinding = typeof newValue === "string" ? newValue : null;
-        console.log(`[bugger] binding updated from storage: ${myTabBinding ?? "(unbound)"}`);
-      }
-    }
-    if ("settings" in changes) {
-      const s = changes["settings"]?.newValue;
-      if (s && typeof s === "object") {
-        autoSubmit = (s as { autoSubmit?: boolean }).autoSubmit ?? true;
-      }
-    }
-  });
+  try {
+    const settingsResp = await chrome.runtime.sendMessage({ type: "getSettings" });
+    autoSubmit = settingsResp?.autoSubmit ?? true;
+  } catch {
+    autoSubmit = true;
+  }
 
   // Listen for binding / settings updates and popup-driven requests.
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -150,9 +116,7 @@ async function init(): Promise<void> {
 
   // Wait for DOM to actually have content before scanning. claude.ai is an
   // SPA — at document_idle, the page shell may exist but message history
-  // hasn't hydrated yet. Without this wait, scanInitial runs while the DOM
-  // is empty of PROMPT blocks, marks zero, and the eventual hydration
-  // surfaces every historical block as "new" via MutationObserver.
+  // hasn't hydrated yet.
   await waitForBlocksToRender();
 
   // Initial scan: mark all pre-existing PROMPT blocks as seen so we never
@@ -160,52 +124,19 @@ async function init(): Promise<void> {
   scanInitial();
   initScanComplete = true;
 
-  // Attach the observer AFTER initScanComplete is set, so any mutation
-  // firing in the same tick doesn't race the init scan.
+  // Attach the observer AFTER initScanComplete is set.
   const observer = new MutationObserver(handleMutations);
   observer.observe(stream, { childList: true, subtree: true, characterData: true });
 
   console.log(
     `[bugger] content script ready (observing <${stream.tagName.toLowerCase()}>, ` +
-      `binding=${myTabBinding ?? "(unbound)"}, tabId=${myTabId})`,
+      `binding=${myTabBinding ?? "(unbound)"})`,
   );
-}
-
-async function loadBindingFromStorage(): Promise<void> {
-  if (myTabId === null) {
-    myTabBinding = null;
-    return;
-  }
-  try {
-    const key = `binding:${myTabId}`;
-    const result = await chrome.storage.session.get(key);
-    const value = result[key];
-    myTabBinding = typeof value === "string" ? value : null;
-  } catch {
-    myTabBinding = null;
-  }
-}
-
-async function loadSettingsFromStorage(): Promise<void> {
-  try {
-    const result = await chrome.storage.session.get("settings");
-    const value = result["settings"];
-    if (value && typeof value === "object") {
-      autoSubmit = (value as { autoSubmit?: boolean }).autoSubmit ?? true;
-    } else {
-      autoSubmit = true;
-    }
-  } catch {
-    autoSubmit = true;
-  }
 }
 
 async function waitForBlocksToRender(): Promise<void> {
   // Wait up to 5 seconds for at least one PROMPT block to appear, OR for
   // claude.ai's chat surface to have ANY assistant message rendered.
-  // Either signal indicates the page has hydrated enough that scanInitial
-  // can find what's there. If we time out, scanInitial will just mark
-  // nothing — and MutationObserver picks up everything that arrives after.
   const start = Date.now();
   while (Date.now() - start < 5_000) {
     const hasPromptBlocks =
@@ -228,26 +159,15 @@ async function waitForMessageStream(): Promise<Element | null> {
 }
 
 function scanInitial(): void {
-  // Two-pass scan, both global:
+  // Global scan: every PROMPT block in the document gets marked as seen,
+  // regardless of whether it lives inside a [data-is-streaming] wrapper.
+  // claude.ai does NOT put data-is-streaming on completed historical turns,
+  // so the prior version (which only iterated findAssistantMessages())
+  // missed every block in chat history. On extension reload that caused
+  // historical blocks to re-dispatch via MutationObserver.
   //
-  // Pass 1: every PROMPT block in the document gets marked as seen, regardless
-  // of whether it lives inside a [data-is-streaming] message wrapper. claude.ai
-  // does NOT put data-is-streaming on completed historical turns, so the prior
-  // version of this function (which only iterated findAssistantMessages())
-  // missed every block in chat history. On extension reload that produced the
-  // exact bug we're fixing here: historical PROMPT blocks went unmarked, then
-  // the first mutation surfaced them as "new" and the dispatch path fired.
-  //
-  // Pass 2: also iterate by-message to assign ordinals. Messages that exist
-  // at init time get sequential ordinals starting from 0; new messages added
-  // later get the next ordinal when first encountered.
-  //
-  // Also: pre-populate dispatchedContent with the content of every existing
-  // block. That way even if a re-render produces a *new* DOM element for the
-  // same prompt (without our data-bugger-handled marker), the content-based
-  // dedupe still catches it. THIS IS THE LOAD-BEARING DEFENSE because
-  // claude.ai DOES re-render elements (React reconciliation churn), and
-  // every re-render produces a fresh element with no data-bugger-handled.
+  // Also pre-populate dispatchedContent so content-level dedupe catches
+  // re-renders of the same prompt.
   const allBlocks = document.querySelectorAll<HTMLElement>(
     '[aria-label="PROMPT code" i], pre code[class*="language-PROMPT" i]',
   );
@@ -280,21 +200,16 @@ function handleMutations(mutations: MutationRecord[]): void {
   const blocksToCheck = new Set<Element>();
 
   for (const mut of mutations) {
-    // Added nodes: could be a new message OR new content within a message.
     for (const node of mut.addedNodes) {
       if (node.nodeType !== Node.ELEMENT_NODE) continue;
       const el = node as Element;
-      // If a new assistant message appeared, assign its ordinal now.
       const newMessages = isAssistantMessage(el) ? [el] : findAssistantMessages(el);
       for (const m of newMessages) getOrAssignMessageOrdinal(m);
-      // Any new PROMPT blocks inside?
       const newBlocks = isCodeBlock(el)
         ? findBuggerBlocksMatchingNode(el)
         : findBuggerBlocksIn(el);
       for (const b of newBlocks) blocksToCheck.add(b);
     }
-    // CharacterData / subtree changes: re-check the containing PROMPT
-    // wrapper, IF this mutation is inside one.
     if (mut.target.nodeType === Node.ELEMENT_NODE) {
       const target = mut.target as Element;
       const wrapper = target.closest('[aria-label="PROMPT code" i]');
@@ -363,8 +278,6 @@ async function tryDispatch(block: Element): Promise<void> {
   const content = extractBlockContent(block).replace(/\s+$/, "");
   if (!content) return;
 
-  // Content-level dedupe: if we've already dispatched (or marked as seen) a
-  // block with this exact content in this tab, skip.
   if (dispatchedContent.has(content)) {
     block.setAttribute("data-bugger-handled", "duplicate-content");
     return;
@@ -372,27 +285,14 @@ async function tryDispatch(block: Element): Promise<void> {
 
   const message = findContainingMessage(block);
   if (!message) {
-    // No streaming wrapper. claude.ai puts data-is-streaming only on
-    // actively-rendering turns; completed historical turns don't have it.
-    // If this block is also INSIDE chat history (above the input bar), it's
-    // historical and must not dispatch. Mark seen and bail.
     block.setAttribute("data-bugger-handled", "historical-no-wrapper");
     dispatchedContent.add(content);
     return;
   }
 
-  // If still streaming, re-arm and wait.
   if (isMessageStillStreaming(message)) {
     scheduleBlockCheck(block);
     return;
-  }
-
-  // Binding wait: if the SW round-trip hadn't populated myTabBinding by
-  // dispatch time, give it a moment in case storage just updated. This
-  // avoids the "unbound; ignoring" path firing on a block that lands
-  // milliseconds before binding propagates.
-  if (!myTabBinding) {
-    await waitForBinding();
   }
 
   if (!myTabBinding) {
@@ -401,7 +301,6 @@ async function tryDispatch(block: Element): Promise<void> {
     return;
   }
 
-  // Single-flight gate.
   if (dispatchInFlight) {
     scheduleBlockCheck(block);
     return;
@@ -462,19 +361,6 @@ async function tryDispatch(block: Element): Promise<void> {
   } finally {
     dispatchInFlight = false;
     statusPill.hideAfter(2000);
-  }
-}
-
-async function waitForBinding(): Promise<void> {
-  // Poll storage every 200ms for up to BINDING_WAIT_MAX_MS. The
-  // chrome.storage.onChanged listener also updates myTabBinding live, but
-  // polling here is a belt+suspenders fallback for environments where the
-  // listener races.
-  const start = Date.now();
-  while (Date.now() - start < BINDING_WAIT_MAX_MS) {
-    await loadBindingFromStorage();
-    if (myTabBinding) return;
-    await sleep(200);
   }
 }
 
