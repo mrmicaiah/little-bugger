@@ -89,6 +89,7 @@ export function runClaudeCode(opts: {
   cwd: string;
   prompt: string;
   apiKey: string;
+  maxTurns: number;
   onPhase?: PhaseUpdate;
 }): Promise<RunResult> {
   return new Promise((resolve) => {
@@ -102,7 +103,7 @@ export function runClaudeCode(opts: {
       "--permission-mode",
       "bypassPermissions",
       "--max-turns",
-      "50",
+      String(opts.maxTurns),
     ];
 
     const env = { ...process.env };
