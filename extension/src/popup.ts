@@ -219,13 +219,7 @@ function renderUnbound(tabId: number, config: DaemonConfig): void {
   document.getElementById("bind-btn")!.addEventListener("click", async () => {
     const select = document.getElementById("project-select") as HTMLSelectElement;
     const project = select.value;
-    console.log(`[bugger:popup] binding tab ${tabId} to project ${project}`);
-    const resp = await send<{ ok?: boolean; error?: string }>({
-      type: "setBinding",
-      tabId,
-      project,
-    });
-    console.log(`[bugger:popup] setBinding response:`, resp);
+    await send({ type: "setBinding", tabId, project });
     await refresh();
   });
 }
@@ -253,21 +247,11 @@ function renderBound(tabId: number, project: string, config: DaemonConfig): void
     <div id="ping-result" class="muted" style="margin-top:8px;"></div>
   `);
 
-  // Rebind ALWAYS writes, even if the selected project is the same as the
-  // currently-bound one. Earlier, this had an early-return when next === project
-  // which made the Rebind button a no-op for the common case (user wants to
-  // refresh the binding after extension reload / state drift). The whole point
-  // of "Rebind" as a button is to FORCE a fresh write to storage.
   document.getElementById("rebind-btn")!.addEventListener("click", async () => {
     const select = document.getElementById("project-select") as HTMLSelectElement;
     const next = select.value;
-    console.log(`[bugger:popup] rebinding tab ${tabId} to project ${next} (was: ${project})`);
-    const resp = await send<{ ok?: boolean; error?: string }>({
-      type: "setBinding",
-      tabId,
-      project: next,
-    });
-    console.log(`[bugger:popup] setBinding response:`, resp);
+    if (next === project) return;
+    await send({ type: "setBinding", tabId, project: next });
     await refresh();
   });
 

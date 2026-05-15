@@ -133,14 +133,6 @@ async function handleMessage(
   sender: chrome.runtime.MessageSender,
 ): Promise<unknown> {
   switch (msg?.type) {
-    case "whoAmI": {
-      // Content script asks for its own tab id (so it can read its binding
-      // directly from chrome.storage.session without a SW round-trip per
-      // dispatch). Tab id never changes during a tab's lifetime so the
-      // content script caches the answer.
-      return { tabId: sender.tab?.id ?? null };
-    }
-
     case "getBindingForMe": {
       const tabId = sender.tab?.id;
       if (tabId === undefined) return { project: null };
