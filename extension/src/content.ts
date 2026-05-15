@@ -61,6 +61,14 @@ let messageOrdinalCounter = 0;
 let myTabBinding: string | null = null;
 let autoSubmit = true;
 
+// Init-scan flag. After scanInitial runs, this stays true forever. We use it
+// as the "did we already complete the initial sweep?" signal. Any PROMPT
+// block tryDispatch ever sees must have either been seen by scanInitial
+// (marked init-scan) OR appeared in a mutation after init. If neither — i.e.
+// we see an unmarked block BEFORE init completes — we defer rather than
+// dispatch, so the init scan can sweep and mark it as historical.
+let initScanComplete = false;
+
 // --- bootstrap --------------------------------------------------------------
 
 async function init(): Promise<void> {
@@ -118,11 +126,13 @@ async function init(): Promise<void> {
     return;
   }
 
-  // Initial scan: assign ordinals and mark all pre-existing PROMPT blocks as
-  // seen so we never re-dispatch historical content.
+  // Initial scan: mark all pre-existing PROMPT blocks as seen so we never
+  // re-dispatch historical content on extension reload or tab restore.
   scanInitial();
+  initScanComplete = true;
 
-  // Attach the observer.
+  // Attach the observer AFTER initScanComplete is set, so any mutation
+  // firing in the same tick doesn't race the init scan.
   const observer = new MutationObserver(handleMutations);
   observer.observe(stream, { childList: true, subtree: true, characterData: true });
 
@@ -140,14 +150,53 @@ async function waitForMessageStream(): Promise<Element | null> {
 }
 
 function scanInitial(): void {
+  // Two-pass scan, both global:
+  //
+  // Pass 1: every PROMPT block in the document gets marked as seen, regardless
+  // of whether it lives inside a [data-is-streaming] message wrapper. claude.ai
+  // does NOT put data-is-streaming on completed historical turns, so the prior
+  // version of this function (which only iterated findAssistantMessages())
+  // missed every block in chat history. On extension reload that produced the
+  // exact bug we're fixing here: historical PROMPT blocks went unmarked, then
+  // the first mutation surfaced them as "new" and the dispatch path fired.
+  //
+  // Pass 2: also iterate by-message to assign ordinals. Messages that exist
+  // at init time get sequential ordinals starting from 0; new messages added
+  // later get the next ordinal when first encountered.
+  //
+  // Also: pre-populate dispatchedContent with the content of every existing
+  // block. That way even if a re-render produces a *new* DOM element for the
+  // same prompt (without our data-bugger-handled marker), the content-based
+  // dedupe still catches it.
+  const allBlocks = document.querySelectorAll<HTMLElement>(
+    '[aria-label="PROMPT code" i], pre code[class*="language-PROMPT" i]',
+  );
+  let markedCount = 0;
+  for (const candidate of allBlocks) {
+    // If the candidate is a <code> inside a <pre>, normalize to the wrapper
+    // (so we mark and dedupe on the same element type that mutation handling
+    // works against).
+    const block = candidate.matches('[aria-label="PROMPT code" i]')
+      ? candidate
+      : (candidate.closest('[aria-label="PROMPT code" i]') ?? candidate.closest("pre") ?? candidate);
+    if (block.getAttribute("data-bugger-handled")) continue;
+    block.setAttribute("data-bugger-handled", "init-scan");
+    markedCount++;
+    const content = extractBlockContent(block).replace(/\s+$/, "");
+    if (content) dispatchedContent.add(content);
+  }
+
+  // Assign ordinals to existing streaming-wrapper messages (if any). New
+  // messages get assigned when first encountered by handleMutations.
   const messages = findAssistantMessages();
   for (const msg of messages) {
     getOrAssignMessageOrdinal(msg);
-    for (const block of findBuggerBlocks(msg)) {
-      // Mark as seen WITHOUT dispatching — these are history.
-      block.setAttribute("data-bugger-handled", "init-scan");
-    }
   }
+
+  console.log(
+    `[bugger] init scan: ${markedCount} historical PROMPT block(s) marked as seen, ` +
+      `${messages.length} streaming-wrapper message(s) found`,
+  );
 }
 
 // --- mutation handling ------------------------------------------------------
@@ -197,21 +246,42 @@ function isCodeBlock(el: Element): boolean {
 }
 
 function findBuggerBlocksIn(root: Element): Element[] {
-  // root might be a message turn, a wrapper, anything — defer to selector lib.
-  const candidate = root.closest("[data-is-streaming]") ?? root;
-  return findBuggerBlocks(candidate);
+  // Search the whole subtree of the added node for PROMPT blocks. Earlier
+  // versions narrowed via root.closest("[data-is-streaming]") first, but
+  // that drops the search when claude.ai re-renders content in containers
+  // that don't have a streaming wrapper.
+  return findBuggerBlocks(root);
 }
 
 function findBuggerBlocksMatchingNode(el: Element): Element[] {
   // The added node IS a pre/code — check if it's a PROMPT block.
+  // First try the streaming wrapper; if absent (historical/restored content),
+  // search the broader subtree the node lives in.
   const message = findContainingMessage(el);
-  if (!message) return [];
-  const blocks = findBuggerBlocks(message);
+  const scope = message ?? el.parentElement ?? el;
+  const blocks = findBuggerBlocks(scope);
   return blocks.filter((b) => b === el || b.contains(el) || el.contains(b));
 }
 
 function scheduleBlockCheck(block: Element): void {
   if (block.getAttribute("data-bugger-handled")) return; // already dispatched or seen
+
+  // Init-scan race guard: if a mutation fires before scanInitial has marked
+  // historical blocks, defer briefly and recheck. Without this, an unmarked
+  // historical block could slip into tryDispatch in the narrow window
+  // between MutationObserver attach and scanInitial completion. (We attach
+  // the observer AFTER scanInitial, but DOM events can fire synchronously
+  // during the same tick — be defensive.)
+  if (!initScanComplete) {
+    const existing = blockDebouncers.get(block);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      blockDebouncers.delete(block);
+      scheduleBlockCheck(block);
+    }, 100);
+    blockDebouncers.set(block, timer);
+    return;
+  }
 
   const existing = blockDebouncers.get(block);
   if (existing) clearTimeout(existing);
@@ -234,23 +304,27 @@ function scheduleBlockCheck(block: Element): void {
 async function tryDispatch(block: Element): Promise<void> {
   if (block.getAttribute("data-bugger-handled")) return;
 
-  const message = findContainingMessage(block);
-  if (!message) {
-    // Can't compute an id without a containing message; defer.
-    scheduleBlockCheck(block);
+  // Defensive: if init scan somehow missed this block AND it's already in
+  // dispatchedContent from a prior life of the content script, treat as
+  // duplicate. This is the belt+suspenders to the init-scan marking.
+  const content = extractBlockContent(block).replace(/\s+$/, "");
+  if (!content) return;
+  if (dispatchedContent.has(content)) {
+    block.setAttribute("data-bugger-handled", "duplicate-content");
     return;
   }
 
-  // Refinement A precondition (1): block content must be non-empty and look
-  // like a closed code block. claude.ai strips the literal ``` fences during
-  // markdown rendering, so the structural signal is: the <pre> element exists
-  // with content, and the message turn either has more content AFTER the
-  // block OR has stopped streaming. The 500ms debounce (in scheduleBlockCheck)
-  // is the load-bearing piece — this content check is the cheap pre-filter.
-  const content = extractBlockContent(block).replace(/\s+$/, "");
-  if (!content) return;
+  const message = findContainingMessage(block);
+  if (!message) {
+    // Historical block (no streaming wrapper). If we got this far without
+    // init-scan having marked it, treat as seen — historical content must
+    // never re-dispatch.
+    block.setAttribute("data-bugger-handled", "historical-no-wrapper");
+    dispatchedContent.add(content);
+    return;
+  }
 
-  // Refinement A precondition (2): if still streaming, re-arm and wait.
+  // If still streaming, re-arm and wait.
   if (isMessageStillStreaming(message)) {
     scheduleBlockCheck(block);
     return;
@@ -258,21 +332,13 @@ async function tryDispatch(block: Element): Promise<void> {
 
   // If the block is the LAST element in the message and streaming just
   // stopped, we still want a brief settle window in case another mutation
-  // arrives. The fast-path delay above (100ms) provides this.
+  // arrives. The fast-path delay in scheduleBlockCheck (100ms) provides this.
 
   if (!myTabBinding) {
     // Not bound — surface in console, don't auto-inject (could confuse user
     // mid-conversation). Popup will surface this state.
     console.warn("[bugger] block detected but tab not bound to any project; ignoring");
     block.setAttribute("data-bugger-handled", "unbound");
-    return;
-  }
-
-  // Content-level dedupe. Synchronous check+add: no await between them,
-  // so concurrent tryDispatches for DOM copies of the same prompt can't
-  // race past this guard. See comment on `dispatchedContent` above.
-  if (dispatchedContent.has(content)) {
-    block.setAttribute("data-bugger-handled", "duplicate-content");
     return;
   }
 
