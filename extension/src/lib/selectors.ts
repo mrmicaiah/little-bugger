@@ -13,6 +13,12 @@
 //   - turn card      : div[data-test-render-count] (each rendered turn)
 //   - code block     : <pre> inside [role="group"][aria-label="<lang> code"],
 //                      with <code class="language-<lang>">
+//
+// DISPATCH TAG: blocks tagged with the language "PROMPT" (case-insensitive)
+// are treated as worker dispatches. Earlier versions used "bugger" but that
+// proved too easy to type by accident in normal conversation, triggering
+// false-positive dispatches. PROMPT is distinctive, all-caps for visual
+// clarity in chat, and unlikely to be typed unintentionally.
 
 type SelectorAttempt = {
   description: string;
@@ -51,19 +57,20 @@ export function findAssistantMessages(root: ParentNode = document): Element[] {
   return Array.from(root.querySelectorAll<Element>("[data-is-streaming]"));
 }
 
-// Within an assistant message, find bugger code blocks. The wrapper is a
-// plain DIV with aria-label="bugger code" (no role attribute, despite what
-// the inspection script suggested earlier — that was inferred from another
-// language's block, but the bugger-language block doesn't get role="group").
+// Within an assistant message, find PROMPT code blocks. The wrapper is a
+// plain DIV with aria-label="PROMPT code" (case-insensitive — the user may
+// type the fence as ```PROMPT, ```prompt, or ```Prompt; claude.ai renders
+// the aria-label in whatever case the fence used).
 export function findBuggerBlocks(messageNode: Element): Element[] {
   // Strategy 1: aria-label on the wrapper DIV.
-  const byAria = messageNode.querySelectorAll<HTMLElement>('[aria-label="bugger code" i]');
+  const byAria = messageNode.querySelectorAll<HTMLElement>('[aria-label="PROMPT code" i]');
   if (byAria.length > 0) return Array.from(byAria);
 
-  // Strategy 2: <code class="language-bugger"> in case Prism ever recognizes
-  // "bugger" as a syntax-highlighter language. Returns the <pre> ancestor.
+  // Strategy 2: <code class="language-PROMPT"> in case Prism ever recognizes
+  // it as a syntax-highlighter language. Returns the <pre> ancestor.
+  // Case-insensitive via [class*=... i].
   const byClass = messageNode.querySelectorAll<Element>(
-    'pre code.language-bugger, pre code[class*="language-bugger" i]',
+    'pre code[class*="language-PROMPT" i]',
   );
   if (byClass.length > 0) {
     return Array.from(byClass).map((c) => c.closest("pre") ?? c);
@@ -72,20 +79,20 @@ export function findBuggerBlocks(messageNode: Element): Element[] {
   return [];
 }
 
-// Extract the prompt text from a bugger block. Because Prism doesn't
-// recognize "bugger" as a language, claude.ai renders the raw markdown
-// fences as visible text inside the <pre>. Strip the leading ```bugger\n
-// and trailing \n``` so the daemon receives just the prompt body.
+// Extract the prompt text from a PROMPT block. Because Prism doesn't
+// recognize it as a language, claude.ai renders the raw markdown fences
+// as visible text inside the <pre>. Strip the leading ```PROMPT\n (any
+// case) and trailing \n``` so the daemon receives just the prompt body.
 export function extractBlockContent(block: Element): string {
   // Find the <pre> with the rendered content. block may be the wrapper DIV
-  // (aria-label="bugger code") or already the <pre> itself.
+  // (aria-label="PROMPT code") or already the <pre> itself.
   const pre =
     block.matches("pre")
       ? block
       : (block.querySelector("pre.code-block__code") ?? block.querySelector("pre"));
   const source = pre ?? block;
   const text = (source.textContent ?? "")
-    .replace(/^```bugger\r?\n/, "")
+    .replace(/^```PROMPT\r?\n/i, "")
     .replace(/\r?\n```\s*$/, "");
   return text;
 }
