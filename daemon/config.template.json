@@ -1,0 +1,10 @@
+{
+  "_comment": "Template only. Real config lives at %APPDATA%\\bugger\\config.json on Windows or ~/.bugger/config.json elsewhere. Copy these projects into the real file, keep your real anthropic_api_key, save. Daemon reloads live.",
+  "port": 8765,
+  "anthropic_api_key": "",
+  "max_turns": 200,
+  "projects": {
+    "little-bugger": "C:\\Users\\mrmic\\Projects\\little-bugger",
+    "white-shovel-software": "C:\\Users\\mrmic\\Projects\\white-shovel-software"
+  }
+}
