@@ -1,5 +1,19 @@
 # Feature: Pending Result Surfacing
 
+## CRITICAL — Output discipline
+
+Your final report MUST follow the output format at the end of this document
+EXACTLY. Every section listed must be present. Every section must contain the
+content described, verbatim where the format calls for verbatim. Do not skip
+sections. Do not consolidate sections. Do not "summarize for brevity."
+Previous workers on this exact task ignored the output format and gave us
+only a raw diff dump, which left us without verification of build status,
+git status, or icon generation. This time follow the format.
+
+Whatever your implementation effort takes, save enough budget to assemble the
+full structured report at the end. The structured report is the deliverable,
+not just the code changes.
+
 ## Context
 
 Current behavior: when a worker job finishes but the user has typed text in the
@@ -37,6 +51,8 @@ tell them to send or delete their text first.
 - If neither `sharp` nor ImageMagick is available, fall back to a small
   Node.js script using `pngjs`. Pick the simplest working option.
 - Write the four purple PNGs to `extension/icons/`.
+- IF you cannot generate the icons (no tool available), say so clearly in the
+  NOTES section of the report. Do NOT silently skip the icon generation.
 
 ### Code changes — `extension/src/lib/tabBinding.ts`
 
@@ -91,7 +107,10 @@ return `true` from the listener for async response on those cases.
   bound+reachable check, check for a pending result for that tab. If one
   exists, return `"purple"`.
 - Update `updateIcon` to map `"purple"` to
-  `icons/bug-purple-{16,32,48,128}.png`.
+  `icons/bug-purple-{16,32,48,128}.png`. The existing code templates the
+  filename from the state string (`icons/bug-${state}-{size}.png`) so this
+  may already work automatically — verify by reading the existing
+  `updateIcon` function.
 - Add a message handler `case "getPendingForTab"` (sent from popup, takes a
   `tabId` in `msg.tabId`): returns `await getPendingResult(tabId)`.
 - Add a message handler `case "retrievePending"` (sent from popup, takes
@@ -154,7 +173,8 @@ return `true` from the listener for async response on those cases.
 ## Output format
 
 Report back with EXACTLY this structure. Do not omit any section. Do not
-summarize sections away.
+summarize sections away. Do not say "for brevity, see the diff." The whole
+point is the structured report — fill in every section.
 
 ```
 SUMMARY: <one sentence describing what was done>
