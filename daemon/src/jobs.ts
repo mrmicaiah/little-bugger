@@ -79,7 +79,9 @@ async function runNext(project: string): Promise<void> {
     return;
   }
 
-  const apiKey = getConfig().anthropic_api_key;
+  const config = getConfig();
+  const apiKey = config.anthropic_api_key;
+  const maxTurns = config.max_turns;
   job.phase = "started";
 
   try {
@@ -87,6 +89,7 @@ async function runNext(project: string): Promise<void> {
       cwd,
       prompt: job.prompt,
       apiKey,
+      maxTurns,
       onPhase: (phase, detail) => {
         job.phase = phase;
         job.phaseDetail = detail;
