@@ -3,8 +3,15 @@
 // binding lives as long as the tab is open, lost on restart, fresh decision.
 
 const STORAGE_KEY_PREFIX = "binding:";
+const PENDING_KEY_PREFIX = "pending:";
 const SETTINGS_KEY = "settings";
 const DISPATCHING_TABS_KEY = "dispatching-tabs";
+
+export type PendingResult = {
+  jobId: string;
+  project: string;
+  timestamp: number;
+};
 
 export type Settings = {
   autoSubmit: boolean;
@@ -16,6 +23,10 @@ export const DEFAULT_SETTINGS: Settings = {
 
 function bindingKey(tabId: number): string {
   return `${STORAGE_KEY_PREFIX}${tabId}`;
+}
+
+function pendingKey(tabId: number): string {
+  return `${PENDING_KEY_PREFIX}${tabId}`;
 }
 
 export async function getBinding(tabId: number): Promise<string | null> {
@@ -30,7 +41,36 @@ export async function setBinding(tabId: number, project: string): Promise<void> 
 }
 
 export async function clearBinding(tabId: number): Promise<void> {
-  await chrome.storage.session.remove(bindingKey(tabId));
+  await chrome.storage.session.remove([bindingKey(tabId), pendingKey(tabId)]);
+}
+
+export async function getPendingResult(tabId: number): Promise<PendingResult | null> {
+  const key = pendingKey(tabId);
+  const result = await chrome.storage.session.get(key);
+  const value = result[key];
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as PendingResult).jobId === "string" &&
+    typeof (value as PendingResult).project === "string" &&
+    typeof (value as PendingResult).timestamp === "number"
+  ) {
+    return value as PendingResult;
+  }
+  return null;
+}
+
+export async function setPendingResult(
+  tabId: number,
+  jobId: string,
+  project: string,
+): Promise<void> {
+  const pending: PendingResult = { jobId, project, timestamp: Date.now() };
+  await chrome.storage.session.set({ [pendingKey(tabId)]: pending });
+}
+
+export async function clearPendingResult(tabId: number): Promise<void> {
+  await chrome.storage.session.remove(pendingKey(tabId));
 }
 
 // chrome.storage.session also persists settings across SW restarts within a

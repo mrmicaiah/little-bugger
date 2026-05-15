@@ -78,12 +78,36 @@ async function init(): Promise<void> {
     autoSubmit = true;
   }
 
-  // Listen for binding / settings updates from the SW.
-  chrome.runtime.onMessage.addListener((msg) => {
+  // Listen for binding / settings updates and popup-driven requests.
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg?.type === "bindingChanged") {
       myTabBinding = msg.project ?? null;
-    } else if (msg?.type === "settingsChanged") {
+      return;
+    }
+    if (msg?.type === "settingsChanged") {
       autoSubmit = msg.autoSubmit ?? true;
+      return;
+    }
+    if (msg?.type === "checkInputClear") {
+      const input = findInputTextarea();
+      if (!input) {
+        sendResponse({ clear: false, error: "input not found" });
+        return;
+      }
+      const clear = readEditorContent(input).trim().length === 0;
+      sendResponse({ clear });
+      return;
+    }
+    if (msg?.type === "injectPending") {
+      void (async () => {
+        try {
+          const ok = await injectResult(msg.job as Job);
+          sendResponse(ok ? { ok: true } : { ok: false, error: "injection aborted" });
+        } catch (err) {
+          sendResponse({ ok: false, error: (err as Error).message });
+        }
+      })();
+      return true; // async response
     }
   });
 
@@ -406,9 +430,13 @@ function formatErrorInjection(message: string, status: number): string {
 
 // --- injection --------------------------------------------------------------
 
-async function injectResult(job: Job): Promise<void> {
+async function injectResult(job: Job): Promise<boolean> {
   // Successful worker results may auto-submit (if the user has the toggle on).
-  await injectText(formatResult(job), { allowAutoSubmit: true });
+  // Pass jobId+project so the guard path can record a pending result.
+  return await injectText(formatResult(job), {
+    allowAutoSubmit: true,
+    pending: { jobId: job.id, project: job.project },
+  });
 }
 
 async function injectErrorMessage(message: string, status: number): Promise<void> {
@@ -416,14 +444,18 @@ async function injectErrorMessage(message: string, status: number): Promise<void
   // dispatch failure before it goes back to the manager — otherwise
   // transient failures (daemon restart, network blip) flood the chat
   // with noise the manager has to talk past.
+  // No pending param: error-path injections never create pending state.
   await injectText(formatErrorInjection(message, status), { allowAutoSubmit: false });
 }
 
-async function injectText(text: string, opts: { allowAutoSubmit: boolean }): Promise<void> {
+async function injectText(
+  text: string,
+  opts: { allowAutoSubmit: boolean; pending?: { jobId: string; project: string } },
+): Promise<boolean> {
   const input = findInputTextarea();
   if (!input) {
     console.warn("[bugger] cannot inject result — input textarea not found");
-    return;
+    return false;
   }
 
   // Safety: don't stomp the user's draft text. If the input has any
@@ -436,11 +468,21 @@ async function injectText(text: string, opts: { allowAutoSubmit: boolean }): Pro
       `[bugger] inject aborted — input has existing text (${existing.length} chars); ` +
         `clear the input manually before the next dispatch`,
     );
-    return;
+    if (opts.pending) {
+      // Surface the orphaned result so the user can retrieve it from the popup.
+      await chrome.runtime
+        .sendMessage({
+          type: "pendingResult",
+          jobId: opts.pending.jobId,
+          project: opts.pending.project,
+        })
+        .catch(() => {});
+    }
+    return false;
   }
 
   if (!performInject(input, text)) {
-    return; // performInject already logged the failure
+    return false; // performInject already logged the failure
   }
 
   if (autoSubmit && opts.allowAutoSubmit) {
@@ -448,10 +490,11 @@ async function injectText(text: string, opts: { allowAutoSubmit: boolean }): Pro
     const send = findSendButton();
     if (!send) {
       console.warn("[bugger] auto-submit on but send button not found; user will need to click Send");
-      return;
+      return true;
     }
     send.click();
   }
+  return true;
 }
 
 function performInject(input: HTMLElement, text: string): boolean {

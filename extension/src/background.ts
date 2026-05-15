@@ -15,6 +15,9 @@ import {
   addDispatchingTab,
   removeDispatchingTab,
   getDispatchingTabs,
+  getPendingResult,
+  setPendingResult,
+  clearPendingResult,
   type Settings,
 } from "./lib/tabBinding.js";
 
@@ -30,11 +33,13 @@ async function isDaemonReachable(force = false): Promise<boolean> {
   return healthCache.ok;
 }
 
-type IconState = "gray" | "green" | "orange";
+type IconState = "gray" | "green" | "orange" | "purple";
 
 async function resolveIconState(tabId: number): Promise<IconState> {
   const dispatching = await getDispatchingTabs();
   if (dispatching.has(tabId)) return "orange";
+  const pending = await getPendingResult(tabId);
+  if (pending) return "purple";
   const binding = await getBinding(tabId);
   const reachable = await isDaemonReachable();
   if (binding && reachable) return "green";
@@ -196,6 +201,54 @@ async function handleMessage(
             .catch(() => {});
         }
       }
+      return { ok: true };
+    }
+
+    case "pendingResult": {
+      const tabId = sender.tab?.id;
+      const jobId = msg["jobId"];
+      const project = msg["project"];
+      if (tabId === undefined || typeof jobId !== "string" || typeof project !== "string") {
+        return { error: "tabId, jobId, project required" };
+      }
+      await setPendingResult(tabId, jobId, project);
+      await updateIcon(tabId);
+      return { ok: true };
+    }
+
+    case "getPendingForTab": {
+      const tabId = typeof msg["tabId"] === "number" ? (msg["tabId"] as number) : sender.tab?.id;
+      if (tabId === undefined) return null;
+      return await getPendingResult(tabId);
+    }
+
+    case "retrievePending": {
+      const tabId = typeof msg["tabId"] === "number" ? (msg["tabId"] as number) : sender.tab?.id;
+      if (tabId === undefined) return { error: "tabId required" };
+      const pending = await getPendingResult(tabId);
+      if (!pending) return { error: "no pending result" };
+      const job = await daemon.getJob(pending.jobId);
+      if (job === null) {
+        // Daemon unreachable — don't clear pending; user can retry later.
+        return { error: "daemon unreachable" };
+      }
+      if (daemon.isDaemonError(job)) {
+        // Job is gone from the daemon (e.g., daemon restarted, TTL). Clear
+        // pending so the icon goes back to green.
+        await clearPendingResult(tabId);
+        await updateIcon(tabId);
+        return { error: job.error };
+      }
+      // Hand the job to the popup but don't clear yet — popup confirms after
+      // a successful inject.
+      return { job };
+    }
+
+    case "pendingRetrieved": {
+      const tabId = typeof msg["tabId"] === "number" ? (msg["tabId"] as number) : sender.tab?.id;
+      if (tabId === undefined) return { error: "tabId required" };
+      await clearPendingResult(tabId);
+      await updateIcon(tabId);
       return { ok: true };
     }
 

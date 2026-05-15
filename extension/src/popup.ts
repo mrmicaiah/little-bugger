@@ -4,6 +4,16 @@
 type Settings = { autoSubmit: boolean };
 type DaemonConfig = { projects: string[] };
 type DaemonError = { error: string; status?: number };
+type PendingResult = { jobId: string; project: string; timestamp: number };
+type Job = {
+  id: string;
+  project: string;
+  status: string;
+  output?: string;
+  diffSummary?: string;
+  error?: string;
+  exitCode?: number;
+};
 
 const contentEl = document.getElementById("content")!;
 const settingsToggleBtn = document.getElementById("settings-toggle")! as HTMLButtonElement;
@@ -50,13 +60,19 @@ async function refresh(): Promise<void> {
     return;
   }
 
-  const [bindingResp, configResp] = await Promise.all([
+  const [bindingResp, configResp, pending] = await Promise.all([
     send<{ project: string | null }>({ type: "getBinding", tabId: tab.id }),
     send<DaemonConfig | DaemonError>({ type: "getDaemonConfig" }),
+    send<PendingResult | null>({ type: "getPendingForTab", tabId: tab.id }),
   ]);
 
   if ("error" in configResp) {
     renderDaemonUnreachable(configResp.error);
+    return;
+  }
+
+  if (pending) {
+    renderPending(tab.id, pending);
     return;
   }
 
@@ -65,6 +81,94 @@ async function refresh(): Promise<void> {
   } else {
     renderUnbound(tab.id, configResp);
   }
+}
+
+function renderPending(tabId: number, pending: PendingResult): void {
+  render(`
+    <div class="banner pending">
+      <strong>Pending worker result</strong>
+      <div class="muted">Result from <code>${escape(pending.project)}</code>, ready to inject.</div>
+    </div>
+    <div id="pending-status"></div>
+    <div class="controls">
+      <button id="retrieve-btn" class="primary">Retrieve and inject</button>
+    </div>
+  `);
+  const btn = document.getElementById("retrieve-btn") as HTMLButtonElement;
+  btn.addEventListener("click", () => void retrievePending(tabId, pending));
+}
+
+async function retrievePending(tabId: number, pending: PendingResult): Promise<void> {
+  const statusEl = document.getElementById("pending-status")!;
+  const btn = document.getElementById("retrieve-btn") as HTMLButtonElement;
+  statusEl.innerHTML = "";
+  btn.disabled = true;
+
+  const resp = await send<{ job?: Job; error?: string }>({ type: "retrievePending", tabId });
+  if (resp.error || !resp.job) {
+    statusEl.innerHTML = `
+      <div class="banner error">
+        ${escape(resp.error ?? "unknown error")}
+        <div class="controls" style="margin-top:6px;">
+          <button id="retry-btn">Retry</button>
+        </div>
+      </div>
+    `;
+    document.getElementById("retry-btn")!.addEventListener("click", () => void refresh());
+    btn.disabled = false;
+    return;
+  }
+  const job = resp.job;
+
+  let clearResp: { clear?: boolean; error?: string };
+  try {
+    clearResp = await chrome.tabs.sendMessage(tabId, { type: "checkInputClear" });
+  } catch (err) {
+    statusEl.innerHTML = `
+      <div class="banner error">
+        Could not reach the content script: ${escape((err as Error).message)}.
+        Make sure the tab is on claude.ai and try again.
+      </div>
+    `;
+    btn.disabled = false;
+    return;
+  }
+
+  if (!clearResp?.clear) {
+    statusEl.innerHTML = `
+      <div class="banner warn">
+        There's text in your chat input. Send it or delete it, then click Retrieve again.
+      </div>
+    `;
+    btn.disabled = false;
+    return;
+  }
+
+  let injectResp: { ok?: boolean; error?: string };
+  try {
+    injectResp = await chrome.tabs.sendMessage(tabId, { type: "injectPending", job });
+  } catch (err) {
+    statusEl.innerHTML = `
+      <div class="banner error">
+        Injection failed: ${escape((err as Error).message)}.
+      </div>
+    `;
+    btn.disabled = false;
+    return;
+  }
+
+  if (!injectResp?.ok) {
+    statusEl.innerHTML = `
+      <div class="banner error">
+        Injection failed: ${escape(injectResp?.error ?? "unknown error")}.
+      </div>
+    `;
+    btn.disabled = false;
+    return;
+  }
+
+  await send({ type: "pendingRetrieved", tabId });
+  window.close();
 }
 
 function render(html: string): void {

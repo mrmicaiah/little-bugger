@@ -10,6 +10,8 @@
   --error-border: #e88;
   --ok-bg: #eaf7ec;
   --ok-border: #8c8;
+  --pending-bg: #f1ecff;
+  --pending-border: #9d82e8;
   --button-bg: #f5f5f5;
   --button-hover: #ebebeb;
 }
@@ -27,6 +29,8 @@
     --error-border: #a44;
     --ok-bg: #1a3a1f;
     --ok-border: #4a7a4a;
+    --pending-bg: #2a1f44;
+    --pending-border: #6f55b8;
     --button-bg: #2a2a2a;
     --button-hover: #353535;
   }
@@ -72,6 +76,7 @@ main { padding: 12px; }
 .banner.warn { background: var(--warn-bg); border-color: var(--warn-border); }
 .banner.error { background: var(--error-bg); border-color: var(--error-border); }
 .banner.ok { background: var(--ok-bg); border-color: var(--ok-border); }
+.banner.pending { background: var(--pending-bg); border-color: var(--pending-border); }
 .banner code {
   background: rgba(0, 0, 0, 0.08);
   padding: 1px 4px;
