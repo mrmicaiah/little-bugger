@@ -18,15 +18,17 @@ Little Bugger removes the message bus. Manager emits a dispatch block; the exten
 
 ### The dispatch block
 
-When a manager wants the worker to do something, it emits a fenced block with the language tag `bugger`:
+When a manager wants the worker to do something, it emits a fenced block with the language tag `PROMPT`:
 
 ````
-```bugger
+```PROMPT
 Run the test suite. Report failing tests with file paths.
 ```
 ````
 
 That's it. No project name in the block — **the browser tab is already bound to a project**, so routing is implicit. The block is just the prompt to send.
+
+The tag is intentionally distinctive and all-caps. Earlier versions used `bugger` as the tag, but it proved too easy to type by accident inside fenced blocks during normal explanation, triggering false-positive dispatches. `PROMPT` is unlikely to appear unintentionally. Matching is case-insensitive — `prompt`, `Prompt`, `PROMPT` all work — but the canonical form is all caps.
 
 ### The extension
 
@@ -38,10 +40,11 @@ A Chrome extension watches the active claude.ai tab. Three responsibilities:
    - 🐛 (gray): not bound, or daemon unreachable
    - 🐛 (green): bound, daemon reachable
    - 🐛 (orange, pulsing): a dispatch is in flight
-   - Click the icon: opens a popup with current binding, ping button, and "rebind" option
+   - 🐛 (purple): a worker result is pending retrieval (orphaned because the chat input had user text when the worker finished)
+   - Click the icon: opens a popup with current binding, ping button, rebind option, and (when applicable) a retrieve button for pending results
 
 3. **Detect dispatches and route results.**
-   - Watches assistant messages for ```` ```bugger ```` blocks
+   - Watches assistant messages for ```` ```PROMPT ```` blocks
    - On detect: extract prompt, POST to `http://localhost:8765/dispatch` with `{project, prompt}`
    - Poll `http://localhost:8765/jobs/:id` until terminal
    - On terminal: inject the result back into the manager's input box as a user message:
@@ -63,8 +66,8 @@ A small Node program running on the user's machine. Listens on `localhost:8765`.
 When a dispatch arrives:
 
 1. Daemon looks up the project's repo path in config
-2. Spawns a fresh Claude Code session: `claude code --no-confirm "<prompt>"` (or whatever the current CLI invocation is) with `cwd` set to the project's repo
-3. Captures stdout/stderr
+2. Spawns a fresh Claude Code session in the project's repo with `--max-turns` from config (default 200)
+3. Captures stdout/stderr via stream-json output format
 4. On completion: runs `git diff --stat` and `git diff` for context, captures both
 5. Stores everything in memory keyed by jobId
 6. Marks job terminal
@@ -85,7 +88,8 @@ Shape:
 {
   "projects": {},
   "anthropic_api_key": "sk-ant-...",
-  "port": 8765
+  "port": 8765,
+  "max_turns": 200
 }
 ```
 
@@ -97,11 +101,14 @@ Adding a project is one entry, name and absolute path:
     "my-project": "/Users/mrmic/Projects/my-project"
   },
   "anthropic_api_key": "sk-ant-...",
-  "port": 8765
+  "port": 8765,
+  "max_turns": 200
 }
 ```
 
 `anthropic_api_key` is here so Claude Code inherits it via the daemon's spawned environment. The daemon never sends this anywhere over the network — Claude Code is the only consumer.
+
+`max_turns` controls the `--max-turns` argument passed to Claude Code per dispatch. Default 200, range 1–1000. Increase if you regularly dispatch substantive multi-file refactors; decrease if you want a tighter ceiling on token spend per dispatch.
 
 Per-machine. The laptop's config has its Windows paths; the Mac's has its `/Users/mrmic/...` paths. Same project names can refer to different paths on each machine. The same skill works on both because the manager doesn't know or care about paths — it just dispatches by the project name the extension bound the tab to.
 
@@ -127,7 +134,7 @@ Per-machine. The laptop's config has its Windows paths; the Mac's has its `/User
 │  │  project)                                          │   │
 │  │                                                    │   │
 │  │  Manager: "I'll run the test suite."             │   │
-│  │  ```bugger                                        │   │
+│  │  ```PROMPT                                        │   │
 │  │  Run the test suite. Report failures.             │   │
 │  │  ```                                              │   │
 │  └──────────────────────────────────────────────────┘   │
@@ -220,7 +227,7 @@ Same plan-review-build discipline as The Big Brain. Each phase ships a working s
 - Manifest v3 extension
 - Toolbar icon with status colors
 - Popup UI with project dropdown, bind/rebind, ping, status display
-- Detects fenced ```` ```bugger ```` blocks in claude.ai conversations
+- Detects fenced ```` ```PROMPT ```` blocks in claude.ai conversations
 - Sends dispatch to daemon, polls for result
 - Auto-injects result back into the chat input
 
@@ -276,6 +283,8 @@ Same plan-review-build discipline as The Big Brain. Each phase ships a working s
 little-bugger/
 ├── README.md
 ├── SPEC.md                       — this document
+├── prompts/                      — version-controlled prompt files for
+│                                    the prompt-file dispatch pattern
 ├── skill/
 │   └── manager-skill.md          — load into claude.ai Projects
 ├── daemon/                       — Node TypeScript daemon
@@ -297,7 +306,8 @@ little-bugger/
 │   ├── icons/
 │   │   ├── bug-gray.png
 │   │   ├── bug-green.png
-│   │   └── bug-orange.png
+│   │   ├── bug-orange.png
+│   │   └── bug-purple.png        — pending-result state
 │   └── src/
 │       ├── background.ts         — service worker, listens for tab events
 │       ├── content.ts            — injected into claude.ai, watches for blocks
@@ -307,6 +317,8 @@ little-bugger/
 │       │   └── popup.css
 │       └── lib/
 │           ├── daemonClient.ts   — fetch wrappers for localhost:8765
+│           ├── selectors.ts      — claude.ai DOM selectors (PROMPT detection)
+│           ├── statusPill.ts     — floating worker-activity pill
 │           └── tabBinding.ts     — chrome.storage glue for tab → project map
 ├── installers/
 │   ├── windows/                  — WiX or NSIS sources
