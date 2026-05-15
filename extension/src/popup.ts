@@ -247,10 +247,15 @@ function renderBound(tabId: number, project: string, config: DaemonConfig): void
     <div id="ping-result" class="muted" style="margin-top:8px;"></div>
   `);
 
+  // Rebind ALWAYS writes the binding, even when the selected project is the
+  // same as the currently-bound one. The whole point of the Rebind button is
+  // to FORCE a fresh write to storage — useful after state drift between
+  // popup display and content script state. Earlier this had an early-return
+  // on next === project which made the button a no-op for the single-project
+  // case (the common case when the user has just one project configured).
   document.getElementById("rebind-btn")!.addEventListener("click", async () => {
     const select = document.getElementById("project-select") as HTMLSelectElement;
     const next = select.value;
-    if (next === project) return;
     await send({ type: "setBinding", tabId, project: next });
     await refresh();
   });
