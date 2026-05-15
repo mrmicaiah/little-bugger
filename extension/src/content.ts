@@ -6,6 +6,9 @@
 //
 // State lives in this script's globals — lost on tab refresh, which is the
 // intended behavior per SPEC §"What's out of scope for v0".
+//
+// DISPATCH TAG: blocks tagged ```PROMPT (case-insensitive) are dispatched.
+// See selectors.ts for the rationale behind the tag choice.
 
 import {
   findMessageStream,
@@ -33,7 +36,7 @@ const dispatchedBlocks = new Map<string, string>();
 // Debounce timers keyed by the block DOM node.
 const blockDebouncers = new WeakMap<Element, ReturnType<typeof setTimeout>>();
 
-// Content-level dedupe. claude.ai sometimes renders the same bugger block
+// Content-level dedupe. claude.ai sometimes renders the same PROMPT block
 // as multiple DOM elements (edit history, regenerated responses,
 // virtualization clones). Each DOM copy is a distinct Element so the
 // per-block data-bugger-handled marker doesn't dedupe across them, and
@@ -91,7 +94,7 @@ async function init(): Promise<void> {
     return;
   }
 
-  // Initial scan: assign ordinals and mark all pre-existing bugger blocks as
+  // Initial scan: assign ordinals and mark all pre-existing PROMPT blocks as
   // seen so we never re-dispatch historical content.
   scanInitial();
 
@@ -136,21 +139,21 @@ function handleMutations(mutations: MutationRecord[]): void {
       // If a new assistant message appeared, assign its ordinal now.
       const newMessages = isAssistantMessage(el) ? [el] : findAssistantMessages(el);
       for (const m of newMessages) getOrAssignMessageOrdinal(m);
-      // Any new bugger blocks inside?
+      // Any new PROMPT blocks inside?
       const newBlocks = isCodeBlock(el)
         ? findBuggerBlocksMatchingNode(el)
         : findBuggerBlocksIn(el);
       for (const b of newBlocks) blocksToCheck.add(b);
     }
-    // CharacterData / subtree changes: re-check the containing bugger
+    // CharacterData / subtree changes: re-check the containing PROMPT
     // wrapper, IF this mutation is inside one. Earlier this used
     // closest("pre") which matched any of the 300+ code blocks on the
     // page — every keystroke churn re-fired the dispatch path on
     // unrelated pres.
     if (mut.target.nodeType === Node.ELEMENT_NODE) {
       const target = mut.target as Element;
-      const buggerWrapper = target.closest('[aria-label="bugger code"]');
-      if (buggerWrapper) blocksToCheck.add(buggerWrapper);
+      const wrapper = target.closest('[aria-label="PROMPT code" i]');
+      if (wrapper) blocksToCheck.add(wrapper);
     }
   }
 
@@ -176,7 +179,7 @@ function findBuggerBlocksIn(root: Element): Element[] {
 }
 
 function findBuggerBlocksMatchingNode(el: Element): Element[] {
-  // The added node IS a pre/code — check if it's a bugger block.
+  // The added node IS a pre/code — check if it's a PROMPT block.
   const message = findContainingMessage(el);
   if (!message) return [];
   const blocks = findBuggerBlocks(message);
@@ -352,7 +355,7 @@ async function computeBlockId(
   messageOrdinal: number,
 ): Promise<string> {
   // Refinement C: sha1(content + indexOfBlockWithinMessage + sequentialMessageOrdinal).
-  const data = new TextEncoder().encode(`${content} ${blockIndex} ${messageOrdinal}`);
+  const data = new TextEncoder().encode(`${content} ${blockIndex} ${messageOrdinal}`);
   const buf = await crypto.subtle.digest("SHA-1", data);
   return Array.from(new Uint8Array(buf))
     .map((b) => b.toString(16).padStart(2, "0"))
