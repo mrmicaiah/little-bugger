@@ -46,6 +46,24 @@ async function resolveIconState(tabId: number): Promise<IconState> {
   return "gray";
 }
 
+async function updateBadge(tabId: number, state: IconState): Promise<void> {
+  let text = "";
+  let color = "#00000000";
+  if (state === "orange") {
+    text = "...";
+    color = "#d97706";
+  } else if (state === "purple") {
+    text = "!";
+    color = "#7c4dff";
+  }
+  try {
+    await chrome.action.setBadgeText({ tabId, text });
+    await chrome.action.setBadgeBackgroundColor({ tabId, color });
+  } catch {
+    // Tab may have closed; harmless.
+  }
+}
+
 async function updateIcon(tabId: number): Promise<void> {
   const state = await resolveIconState(tabId);
   try {
@@ -61,6 +79,7 @@ async function updateIcon(tabId: number): Promise<void> {
   } catch {
     // Tab may have closed between the state lookup and the icon set; harmless.
   }
+  await updateBadge(tabId, state);
 }
 
 async function updateAllVisibleIcons(): Promise<void> {

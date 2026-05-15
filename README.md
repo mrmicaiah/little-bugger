@@ -6,7 +6,7 @@ A small bridge between Claude managers in your browser and Claude Code workers o
 
 You run multiple Claude.ai conversations as managers — one per project. Each conversation is bound to a repo on your machine via a Chrome extension. When a manager dispatches work, the daemon pipes it to Claude Code running in the right repo. Results flow back into the chat automatically.
 
-You stop being the message bus. The terminals stay minimized. You work in browser tabs that look like paper, not consoles.
+You stop being the message bus. The terminals stay minimized. You work in browser tabs that look like paper, not consoles. Dispatches are triggered by fenced blocks tagged `PROMPT`.
 
 ## Status
 
